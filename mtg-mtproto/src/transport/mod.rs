@@ -14,6 +14,7 @@
 //! [MTProto transports]: https://core.telegram.org/mtproto#mtproto-transport
 
 mod abridged;
+pub mod fake_tls;
 mod full;
 mod intermediate;
 mod obfuscated;
