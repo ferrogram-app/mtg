@@ -138,7 +138,10 @@ impl Client {
             Ok(x) => x,
             Err(InvocationError::Rpc(err)) if err.code == 303 => {
                 let old_dc_id = self.0.session.home_dc_id()?;
-                let new_dc_id = err.value.unwrap() as i32;
+                let Some(new_dc_id) = err.value else {
+                    return Err(InvocationError::Rpc(err));
+                };
+                let new_dc_id = new_dc_id as i32;
                 // Disconnect from current DC to cull the now-unused connection.
                 // This also gives a chance for the new home DC to export its authorization
                 // if there's a need to connect back to the old DC after having logged in.
@@ -152,7 +155,7 @@ impl Client {
         match result {
             tl::enums::auth::Authorization::Authorization(x) => self.complete_login(x).await,
             tl::enums::auth::Authorization::SignUpRequired(_) => {
-                panic!("API returned SignUpRequired even though we're logging in as a bot");
+                Err(InvocationError::Dropped("SignUpRequired for a bot login"))
             }
         }
     }
@@ -211,12 +214,21 @@ impl Client {
         let sent_code: tl::types::auth::SentCode = match self.invoke(&request).await {
             Ok(x) => match x {
                 SC::Code(code) => code,
-                SC::Success(_) => panic!("should not have logged in yet"),
-                SC::PaymentRequired(_) => unimplemented!(),
+                SC::Success(_) => {
+                    return Err(InvocationError::Dropped("unexpected SentCodeSuccess"));
+                }
+                SC::PaymentRequired(_) => {
+                    return Err(InvocationError::Dropped(
+                        "SentCodePaymentRequired is unsupported",
+                    ));
+                }
             },
             Err(InvocationError::Rpc(err)) if err.code == 303 => {
                 let old_dc_id = self.0.session.home_dc_id()?;
-                let new_dc_id = err.value.unwrap() as i32;
+                let Some(new_dc_id) = err.value else {
+                    return Err(InvocationError::Rpc(err));
+                };
+                let new_dc_id = new_dc_id as i32;
                 // Disconnect from current DC to cull the now-unused connection.
                 // This also gives a chance for the new home DC to export its authorization
                 // if there's a need to connect back to the old DC after having logged in.
@@ -224,8 +236,14 @@ impl Client {
                 self.0.session.set_home_dc_id(new_dc_id).await?;
                 match self.invoke(&request).await? {
                     SC::Code(code) => code,
-                    SC::Success(_) => panic!("should not have logged in yet"),
-                    SC::PaymentRequired(_) => unimplemented!(),
+                    SC::Success(_) => {
+                        return Err(InvocationError::Dropped("unexpected SentCodeSuccess"));
+                    }
+                    SC::PaymentRequired(_) => {
+                        return Err(InvocationError::Dropped(
+                            "SentCodePaymentRequired is unsupported",
+                        ));
+                    }
                 }
             }
             Err(e) => return Err(e),

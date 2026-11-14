@@ -332,3 +332,20 @@ fn parse_then_unparse_time_with_format() {
     let expected = "Some <time datetime=\"2026-09-27T10:13:14Z\" data-format=\"wDt\">time</time>";
     assert_eq!(generated, expected);
 }
+
+#[test]
+fn non_numeric_mention_id_is_a_plain_link() {
+    let (text, entities) = parse_html_message("<a href=\"tg://user?id=abc\">x</a>");
+    assert_eq!(text, "x");
+    assert_eq!(
+        entities,
+        vec![
+            tl::types::MessageEntityTextUrl {
+                offset: 0,
+                length: 1,
+                url: "tg://user?id=abc".into()
+            }
+            .into()
+        ]
+    );
+}

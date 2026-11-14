@@ -122,7 +122,8 @@ impl DownloadIter {
                     Ok(Some(f.bytes))
                 }
                 Ok(File::CdnRedirect(_)) => {
-                    panic!("API returned File::CdnRedirect even though cdn_supported = false");
+                    // the server ignored cdn_supported = false: fail instead of trusting it
+                    break Err(InvocationError::Dropped("unexpected CdnRedirect"));
                 }
                 Err(InvocationError::Rpc(err)) if &err.name == "AUTH_KEY_UNREGISTERED" => {
                     match self.client.copy_auth_to_dc(dc).await {
@@ -130,8 +131,10 @@ impl DownloadIter {
                         Err(e) => Err(e),
                     }
                 }
-                Err(InvocationError::Rpc(err)) if err.code == FILE_MIGRATE_ERROR => {
-                    dc = err.value.unwrap() as _;
+                Err(InvocationError::Rpc(err))
+                    if err.code == FILE_MIGRATE_ERROR && err.value.is_some() =>
+                {
+                    dc = err.value.unwrap_or_default() as _;
                     continue;
                 }
                 Err(e) => Err(e),
@@ -298,12 +301,12 @@ impl Client {
                     };
                     match client.invoke_in_dc(task_dc, request).await {
                         Ok(tl::enums::upload::File::File(file)) => {
-                            tx.send((offset as u64, file.bytes)).unwrap();
+                            if tx.send((offset as u64, file.bytes)).is_err() {
+                                return Err(InvocationError::Dropped("download receiver closed"));
+                            }
                         }
                         Ok(tl::enums::upload::File::CdnRedirect(_)) => {
-                            panic!(
-                                "API returned File::CdnRedirect even though cdn_supported = false"
-                            );
+                            return Err(InvocationError::Dropped("unexpected CdnRedirect"));
                         }
                         Err(InvocationError::Rpc(err)) if &err.name == "AUTH_KEY_UNREGISTERED" => {
                             match client.copy_auth_to_dc(task_dc).await {
@@ -315,8 +318,8 @@ impl Client {
                             }
                         }
                         Err(InvocationError::Rpc(err)) => {
-                            if err.code == FILE_MIGRATE_ERROR {
-                                task_dc = err.value.unwrap() as _;
+                            if let (FILE_MIGRATE_ERROR, Some(dc)) = (err.code, err.value) {
+                                task_dc = dc as _;
                                 retry_offset = Some(offset);
                                 continue;
                             }

@@ -45,21 +45,23 @@ pub(crate) fn date(date: i32) -> Timestamp {
     Timestamp::from_second(date as i64).expect("date out of range")
 }
 
+/// `(salt1, salt2, p, g)` of the 2FA KDF.
+pub(crate) type PasswordParams<'a> = (&'a Vec<u8>, &'a Vec<u8>, &'a Vec<u8>, &'a i32);
+
 pub(crate) fn extract_password_parameters(
     current_algo: &tl::enums::PasswordKdfAlgo,
-) -> (&Vec<u8>, &Vec<u8>, &Vec<u8>, &i32) {
+) -> Option<PasswordParams<'_>> {
     let tl::types::PasswordKdfAlgoSha256Sha256Pbkdf2Hmacsha512iter100000Sha256ModPow {
         salt1,
         salt2,
         p,
         g,
     } = match current_algo {
-        tl::enums::PasswordKdfAlgo::Unknown => panic!(
-            "Unknown KDF (most likely, the client is outdated and does not support the specified KDF algorithm)"
-        ),
+        // most likely the client is outdated and does not support the KDF algorithm
+        tl::enums::PasswordKdfAlgo::Unknown => return None,
         tl::enums::PasswordKdfAlgo::Sha256Sha256Pbkdf2Hmacsha512iter100000Sha256ModPow(alg) => alg,
     };
-    (salt1, salt2, p, g)
+    Some((salt1, salt2, p, g))
 }
 
 pub(crate) fn peer_from_message(message: &tl::enums::Message) -> Option<tl::enums::Peer> {

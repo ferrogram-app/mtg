@@ -117,8 +117,11 @@ pub fn parse_html_message(message: &str) -> (String, Vec<tl::enums::MessageEntit
                             .map(|a| a.value.to_string())
                             .unwrap_or_else(|| "".to_string());
 
-                        if let Some(id) = url.strip_prefix(MENTION_URL_PREFIX) {
-                            let user_id = id.parse::<i64>().unwrap();
+                        // a non-numeric id is not a mention: keep it as a plain link
+                        if let Some(user_id) = url
+                            .strip_prefix(MENTION_URL_PREFIX)
+                            .and_then(|id| id.parse::<i64>().ok())
+                        {
                             entities.push(
                                 tl::types::MessageEntityMentionName {
                                     offset,

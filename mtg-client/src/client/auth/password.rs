@@ -56,8 +56,18 @@ impl Client {
         password: impl AsRef<[u8]>,
     ) -> Result<User, SignInError> {
         let mut password_info = password_token.password;
-        let current_algo = password_info.current_algo.clone().unwrap();
-        let mut params = utils::extract_password_parameters(&current_algo);
+        let bad_srp = |what: &'static str| {
+            SignInError::Other(InvocationError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                what,
+            )))
+        };
+        let current_algo = password_info
+            .current_algo
+            .clone()
+            .ok_or_else(|| bad_srp("password info without a KDF algorithm"))?;
+        let mut params = utils::extract_password_parameters(&current_algo)
+            .ok_or_else(|| bad_srp("unsupported password KDF algorithm"))?;
 
         // Telegram sent us incorrect parameters, trying to get them again
         if !check_p_and_g(params.2, params.3) {
@@ -66,16 +76,22 @@ impl Client {
                 .await
                 .map_err(SignInError::Other)?
                 .password;
-            params =
-                utils::extract_password_parameters(password_info.current_algo.as_ref().unwrap());
+            params = password_info
+                .current_algo
+                .as_ref()
+                .and_then(utils::extract_password_parameters)
+                .ok_or_else(|| bad_srp("unsupported password KDF algorithm"))?;
             if !check_p_and_g(params.2, params.3) {
-                panic!("Failed to get correct password information from Telegram")
+                return Err(bad_srp("Telegram sent incorrect password parameters twice"));
             }
         }
 
         let (salt1, salt2, p, g) = params;
 
-        let g_b = password_info.srp_b.clone().unwrap();
+        let g_b = password_info
+            .srp_b
+            .clone()
+            .ok_or_else(|| bad_srp("password info without srp_b"))?;
         let a = password_info.secure_random.clone();
 
         // None: the server sent a g_b that is out of range
@@ -88,7 +104,9 @@ impl Client {
 
         let check_password = tl::functions::auth::CheckPassword {
             password: tl::enums::InputCheckPasswordSrp::Srp(tl::types::InputCheckPasswordSrp {
-                srp_id: password_info.srp_id.unwrap(),
+                srp_id: password_info
+                    .srp_id
+                    .ok_or_else(|| bad_srp("password info without srp_id"))?,
                 a: g_a.to_vec(),
                 m1: m1.to_vec(),
             }),
@@ -98,7 +116,9 @@ impl Client {
             Ok(tl::enums::auth::Authorization::Authorization(x)) => {
                 self.complete_login(x).await.map_err(SignInError::Other)
             }
-            Ok(tl::enums::auth::Authorization::SignUpRequired(_x)) => panic!("Unexpected result"),
+            Ok(tl::enums::auth::Authorization::SignUpRequired(_)) => {
+                Err(bad_srp("unexpected SignUpRequired after a password check"))
+            }
             Err(err) if err.is("PASSWORD_HASH_INVALID") => {
                 Err(SignInError::InvalidPassword(PasswordToken {
                     password: password_info,

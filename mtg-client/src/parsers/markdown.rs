@@ -58,8 +58,11 @@ pub fn parse_markdown_message(message: &str) -> (String, Vec<tl::enums::MessageE
 
         // [text link](https://example.com) or [user mention](tg://user?id=12345678)
         Event::Start(Tag::Link { dest_url, .. }) => {
-            if let Some(id) = dest_url.strip_prefix(MENTION_URL_PREFIX) {
-                let user_id = id.parse::<i64>().unwrap();
+            // a non-numeric id is not a mention: keep it as a plain link
+            if let Some(user_id) = dest_url
+                .strip_prefix(MENTION_URL_PREFIX)
+                .and_then(|id| id.parse::<i64>().ok())
+            {
                 entities.push(
                     tl::types::MessageEntityMentionName {
                         offset,
@@ -229,6 +232,23 @@ pub fn generate_markdown_message(message: &str, entities: &[tl::enums::MessageEn
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn non_numeric_mention_id_is_a_plain_link() {
+        let (text, entities) = parse_markdown_message("[x](tg://user?id=abc)");
+        assert_eq!(text, "x");
+        assert_eq!(
+            entities,
+            vec![
+                tl::types::MessageEntityTextUrl {
+                    offset: 0,
+                    length: 1,
+                    url: "tg://user?id=abc".into()
+                }
+                .into()
+            ]
+        );
+    }
 
     #[test]
     fn parse_leading() {
