@@ -7,8 +7,6 @@
 // except according to those terms.
 
 use std::collections::HashMap;
-use std::fmt;
-use std::net::AddrParseError;
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -21,9 +19,11 @@ use crate::types::{
 };
 use crate::{BoxFuture, DEFAULT_DC, KNOWN_DC_OPTIONS, Session};
 
-const VERSION: i64 = 1;
+mod db;
+mod error;
 
-struct Database(libsql::Connection);
+use db::Database;
+pub use error::SqliteSessionError;
 
 struct Cache {
     pub home_dc: i32,
@@ -36,41 +36,6 @@ pub struct SqliteSession {
     cache: Mutex<Cache>,
 }
 
-#[derive(Debug)]
-pub enum SqliteSessionError {
-    Poisoned,
-    AddrParse(std::net::AddrParseError),
-    Sql(libsql::Error),
-    InvalidAuthKeyLength(usize),
-}
-
-impl std::error::Error for SqliteSessionError {}
-
-impl fmt::Display for SqliteSessionError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            SqliteSessionError::Poisoned => write!(f, "session lock is poisoned"),
-            SqliteSessionError::AddrParse(_) => write!(f, "invalid socket address syntax"),
-            SqliteSessionError::Sql(err) => write!(f, "{err}"),
-            SqliteSessionError::InvalidAuthKeyLength(actual) => {
-                write!(f, "invalid auth_key length: expected 256, got {actual}")
-            }
-        }
-    }
-}
-
-impl From<AddrParseError> for SqliteSessionError {
-    fn from(x: AddrParseError) -> Self {
-        Self::AddrParse(x)
-    }
-}
-
-impl From<libsql::Error> for SqliteSessionError {
-    fn from(x: libsql::Error) -> Self {
-        Self::Sql(x)
-    }
-}
-
 #[repr(u8)]
 enum PeerSubtype {
     UserSelf = 1,
@@ -80,127 +45,6 @@ enum PeerSubtype {
     Broadcast = 8,
     Gigagroup = 12,
     Community = 16,
-}
-
-impl Database {
-    async fn init(&self) -> libsql::Result<()> {
-        let mut user_version: i64 = self
-            .fetch_one("PRAGMA user_version", params![], |row| row.get(0))
-            .await?
-            .unwrap_or(0);
-        if user_version == VERSION {
-            return Ok(());
-        }
-
-        if user_version == 0 {
-            self.migrate_v0_to_v1().await?;
-            user_version += 1;
-        }
-        if user_version == VERSION {
-            // Can't bind PRAGMA parameters, but `VERSION` is not user-controlled input.
-            self.0
-                .execute(&format!("PRAGMA user_version = {VERSION}"), params![])
-                .await?;
-        }
-        Ok(())
-    }
-
-    async fn migrate_v0_to_v1(&self) -> libsql::Result<()> {
-        let transaction = self.begin_transaction().await?;
-        transaction
-            .execute(
-                "CREATE TABLE dc_home (
-                dc_id INTEGER NOT NULL,
-                PRIMARY KEY(dc_id))",
-                params![],
-            )
-            .await?;
-        transaction
-            .execute(
-                "CREATE TABLE dc_option (
-                dc_id INTEGER NOT NULL,
-                ipv4 TEXT NOT NULL,
-                ipv6 TEXT NOT NULL,
-                auth_key BLOB,
-                PRIMARY KEY (dc_id))",
-                params![],
-            )
-            .await?;
-        transaction
-            .execute(
-                "CREATE TABLE peer_info (
-                peer_id INTEGER NOT NULL,
-                hash INTEGER,
-                subtype INTEGER,
-                PRIMARY KEY (peer_id))",
-                params![],
-            )
-            .await?;
-        transaction
-            .execute(
-                "CREATE TABLE update_state (
-                pts INTEGER NOT NULL,
-                qts INTEGER NOT NULL,
-                date INTEGER NOT NULL,
-                seq INTEGER NOT NULL)",
-                params![],
-            )
-            .await?;
-        transaction
-            .execute(
-                "CREATE TABLE channel_state (
-                peer_id INTEGER NOT NULL,
-                pts INTEGER NOT NULL,
-                PRIMARY KEY (peer_id))",
-                params![],
-            )
-            .await?;
-
-        transaction.commit().await?;
-        Ok(())
-    }
-
-    async fn begin_transaction(&self) -> libsql::Result<libsql::Transaction> {
-        self.0.transaction().await
-    }
-
-    async fn fetch_one<
-        T,
-        P: libsql::params::IntoParams,
-        F: FnOnce(libsql::Row) -> libsql::Result<T>,
-    >(
-        &self,
-        statement: &str,
-        params: P,
-        select: F,
-    ) -> libsql::Result<Option<T>> {
-        let mut statement = self.0.prepare(statement).await?;
-        let result = statement.query_row(params).await;
-        match result {
-            Ok(value) => Ok(Some(select(value)?)),
-            Err(libsql::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e),
-        }
-    }
-
-    async fn fetch_all<
-        T,
-        P: libsql::params::IntoParams,
-        F: FnMut(libsql::Row) -> Result<T, SqliteSessionError>,
-    >(
-        &self,
-        statement: &str,
-        params: P,
-        mut select: F,
-    ) -> Result<Vec<T>, SqliteSessionError> {
-        let statement = self.0.prepare(statement).await?;
-        let mut rows = statement.query(params).await?;
-        let mut result = Vec::new();
-        while let Some(row) = rows.next().await? {
-            result.push(select(row)?);
-        }
-        Ok(result)
-    }
 }
 
 impl SqliteSession {
@@ -628,178 +472,4 @@ impl Session for SqliteSession {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
-
-    use {DcOption, KNOWN_DC_OPTIONS, PeerInfo, Session, UpdateState};
-
-    use super::*;
-
-    #[test]
-    fn exercise_sqlite_session() {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(do_exercise_sqlite_session());
-    }
-
-    async fn do_exercise_sqlite_session() {
-        let session = SqliteSession::open(":memory:").await.unwrap();
-
-        assert_eq!(session.home_dc_id().unwrap(), DEFAULT_DC);
-        session.set_home_dc_id(DEFAULT_DC + 1).await.unwrap();
-        assert_eq!(session.home_dc_id().unwrap(), DEFAULT_DC + 1);
-
-        assert_eq!(
-            session.dc_option(KNOWN_DC_OPTIONS[0].id).unwrap(),
-            Some(KNOWN_DC_OPTIONS[0].clone())
-        );
-        let new_dc_option = DcOption {
-            id: KNOWN_DC_OPTIONS
-                .iter()
-                .map(|dc_option| dc_option.id)
-                .max()
-                .unwrap()
-                + 1,
-            ipv4: SocketAddrV4::new(Ipv4Addr::from_bits(0), 1),
-            ipv6: SocketAddrV6::new(Ipv6Addr::from_bits(0), 1, 0, 0),
-            auth_key: Some([1; 256]),
-        };
-        assert_eq!(session.dc_option(new_dc_option.id).unwrap(), None);
-        session.set_dc_option(&new_dc_option).await.unwrap();
-        assert_eq!(
-            session.dc_option(new_dc_option.id).unwrap(),
-            Some(new_dc_option)
-        );
-
-        assert_eq!(session.peer(PeerId::self_user()).await.unwrap(), None);
-        assert_eq!(session.peer(PeerId::user_unchecked(1)).await.unwrap(), None);
-        let peer = PeerInfo::User {
-            id: 1,
-            auth: None,
-            bot: Some(true),
-            is_self: Some(true),
-        };
-        session.cache_peer(peer.clone()).await.unwrap();
-        assert_eq!(
-            session.peer(PeerId::self_user()).await.unwrap(),
-            Some(peer.clone())
-        );
-        assert_eq!(
-            session.peer(PeerId::user_unchecked(1)).await.unwrap(),
-            Some(peer)
-        );
-
-        assert_eq!(
-            session.peer(PeerId::channel_unchecked(1)).await.unwrap(),
-            None
-        );
-        let peer = PeerInfo::Channel {
-            id: 1,
-            auth: Some(PeerAuth::from_hash(-1)),
-            kind: Some(ChannelKind::Broadcast),
-        };
-        session.cache_peer(peer.clone()).await.unwrap();
-        assert_eq!(
-            session.peer(PeerId::channel_unchecked(1)).await.unwrap(),
-            Some(peer)
-        );
-
-        let peers = vec![
-            PeerInfo::Channel {
-                id: 2,
-                auth: Some(PeerAuth::from_hash(-2)),
-                kind: Some(ChannelKind::Megagroup),
-            },
-            PeerInfo::Channel {
-                id: 3,
-                auth: Some(PeerAuth::from_hash(-3)),
-                kind: None,
-            },
-        ];
-        session.cache_peers(peers.clone()).await.unwrap();
-        for peer in peers.iter() {
-            assert_eq!(session.peer(peer.id()).await.unwrap().as_ref(), Some(peer));
-        }
-
-        // If the inserted peer is going to be updated with some fields changed
-        // from `Some` to `None`, the old `Some` is expected to be kept.
-        let new_inserted_peers = vec![
-            PeerInfo::Channel {
-                id: 2,
-                auth: None,
-                kind: Some(ChannelKind::Broadcast),
-            },
-            PeerInfo::Channel {
-                id: 3,
-                auth: Some(PeerAuth::from_hash(-30)),
-                kind: None,
-            },
-        ];
-        session.cache_peers(new_inserted_peers).await.unwrap();
-        assert_eq!(
-            session.peer(PeerId::channel_unchecked(2)).await.unwrap(),
-            Some(PeerInfo::Channel {
-                id: 2,
-                auth: Some(PeerAuth::from_hash(-2)),
-                kind: Some(ChannelKind::Broadcast),
-            })
-        );
-        assert_eq!(
-            session.peer(PeerId::channel_unchecked(3)).await.unwrap(),
-            Some(PeerInfo::Channel {
-                id: 3,
-                auth: Some(PeerAuth::from_hash(-30)),
-                kind: None
-            })
-        );
-
-        assert_eq!(
-            session.updates_state().await.unwrap(),
-            UpdatesState::default()
-        );
-        session
-            .set_update_state(UpdateState::All(UpdatesState {
-                pts: 1,
-                qts: 2,
-                date: 3,
-                seq: 4,
-                channels: vec![
-                    ChannelState { id: 5, pts: 6 },
-                    ChannelState { id: 7, pts: 8 },
-                ],
-            }))
-            .await
-            .unwrap();
-        session
-            .set_update_state(UpdateState::Primary {
-                pts: 2,
-                date: 4,
-                seq: 5,
-            })
-            .await
-            .unwrap();
-        session
-            .set_update_state(UpdateState::Secondary { qts: 3 })
-            .await
-            .unwrap();
-        session
-            .set_update_state(UpdateState::Channel { id: 7, pts: 9 })
-            .await
-            .unwrap();
-        assert_eq!(
-            session.updates_state().await.unwrap(),
-            UpdatesState {
-                pts: 2,
-                qts: 3,
-                date: 4,
-                seq: 5,
-                channels: vec![
-                    ChannelState { id: 5, pts: 6 },
-                    ChannelState { id: 7, pts: 9 },
-                ],
-            }
-        );
-    }
-}
+mod tests;
