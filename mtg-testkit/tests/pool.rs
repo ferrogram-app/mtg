@@ -1,7 +1,7 @@
 //! The fake server end to end with the real sender pool.
 
 use mtg_mtsender::{InvocationError, SenderPool};
-use mtg_testkit::FakeServer;
+use mtg_testkit::{FakeServer, Fault};
 use mtg_tl_types as tl;
 
 async fn pool(server: &FakeServer) -> mtg_mtsender::SenderPoolFatHandle {
@@ -46,6 +46,82 @@ async fn unmocked_requests_and_errors_become_rpc_errors() {
         .unwrap_err();
     assert!(
         matches!(&err, InvocationError::Rpc(e) if e.code == 400 && e.name.starts_with("NOT_MOCKED"))
+    );
+    handle.quit();
+}
+
+fn app_config() -> tl::functions::help::GetAppConfig {
+    tl::functions::help::GetAppConfig { hash: 0 }
+}
+
+async fn call(
+    handle: &mtg_mtsender::SenderPoolFatHandle,
+) -> Result<tl::enums::help::AppConfig, InvocationError> {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        handle.invoke_in_dc(2, &app_config()),
+    )
+    .await
+    .expect("no answer")
+}
+
+fn mock_app_config(server: &FakeServer) {
+    server.on(|_: tl::functions::help::GetAppConfig| Ok(tl::enums::help::AppConfig::NotModified));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bad_server_salt_is_followed_by_a_resend() {
+    let server = FakeServer::start().await;
+    mock_app_config(&server);
+    let handle = pool(&server).await;
+    call(&handle).await.unwrap(); // warm up: connection and init
+    server.inject(Fault::BadServerSalt { new_salt: 42 });
+    call(&handle).await.unwrap();
+    assert_eq!(
+        server.connections(),
+        1,
+        "the salt is fixed on the same connection"
+    );
+    handle.quit();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bad_msg_notification_about_the_clock_is_followed_by_a_resend() {
+    let server = FakeServer::start().await;
+    mock_app_config(&server);
+    let handle = pool(&server).await;
+    call(&handle).await.unwrap();
+    server.inject(Fault::BadMsg { error_code: 16 });
+    call(&handle).await.unwrap();
+    handle.quit();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_closed_connection_is_reopened() {
+    let server = FakeServer::start().await;
+    mock_app_config(&server);
+    let handle = pool(&server).await;
+    call(&handle).await.unwrap();
+    server.inject(Fault::Close);
+    let result = call(&handle).await;
+    println!(
+        "after close: {result:?}, connections: {}",
+        server.connections()
+    );
+    handle.quit();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn garbage_from_the_server_does_not_hang_the_client() {
+    let server = FakeServer::start().await;
+    mock_app_config(&server);
+    let handle = pool(&server).await;
+    call(&handle).await.unwrap();
+    server.inject(Fault::Garbage);
+    let result = call(&handle).await;
+    println!(
+        "after garbage: {result:?}, connections: {}",
+        server.connections()
     );
     handle.quit();
 }

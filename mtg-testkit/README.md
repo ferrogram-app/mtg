@@ -7,4 +7,9 @@ pre-shared auth key (`KEY`), so clients skip the key exchange. `server.session()
 DC 2 points at it. `server.on(|req: SomeRequest| Ok(result))` answers one request type (`Err((code, "TEXT"))`
 becomes an `rpc_error`); `server.requests()` lists what arrived, by name. Unmocked requests get `NOT_MOCKED_<id>`.
 
+Failure modes: `server.inject(Fault::...)` makes the next request that reaches a handler fail instead (queued, one
+per request): `Close` (drop the connection), `BadServerSalt { new_salt }`, `BadMsg { error_code }`, `Garbage`
+(bytes that do not decrypt). `server.connections()` counts accepted TCP connections. `get_future_salts` is
+answered by default (the client asks after a salt reset).
+
 Moved from `ferrogram-android/core/tests/common`; core switches to this crate after the next `rev` bump.

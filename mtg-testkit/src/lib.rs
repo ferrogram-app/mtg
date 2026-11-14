@@ -23,9 +23,31 @@ pub const KEY: [u8; 256] = [7; 256];
 pub type Reply = Result<Vec<u8>, (i32, String)>;
 type Handler = Box<dyn Fn(&mut tl::Cursor) -> Reply + Send + Sync>;
 
+/// A failure the server injects instead of answering the next request(s); see [`FakeServer::inject`].
+#[derive(Clone, Debug, PartialEq)]
+pub enum Fault {
+    /// Close the connection without answering.
+    Close,
+    /// Answer with `bad_server_salt` carrying `new_salt` (the client should resend).
+    BadServerSalt { new_salt: i64 },
+    /// Answer with `bad_msg_notification` and this `error_code` (16/17 msg_id, 32/33 seq_no, 48 salt, ...).
+    BadMsg { error_code: i32 },
+    /// Answer with garbage that does not decrypt (wrong key id and body).
+    Garbage,
+}
+
+/// One thing the server sends or does in response to a message.
+enum Out {
+    Send(Vec<u8>),
+    /// Junk framed by the transport as it is (does not decrypt).
+    Raw(Vec<u8>),
+    Close,
+}
+
 #[derive(Default)]
 struct State {
     handlers: HashMap<u32, Handler>,
+    faults: std::collections::VecDeque<Fault>,
 }
 
 #[derive(Clone)]
@@ -34,6 +56,7 @@ pub struct FakeServer {
     state: Arc<Mutex<State>>,
     // separate lock: handlers run while `state` is held
     seen: Arc<Mutex<Vec<&'static str>>>,
+    connections: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl FakeServer {
@@ -67,11 +90,14 @@ impl FakeServer {
             addr: listener.local_addr().unwrap(),
             state: Default::default(),
             seen: Default::default(),
+            connections: Default::default(),
         };
         server.on(|_: tl::functions::help::GetConfig| Ok(config()));
         let s = server.clone();
         tokio::spawn(async move {
             while let Ok((sock, _)) = listener.accept().await {
+                s.connections
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 tokio::spawn(s.clone().serve(sock));
             }
         });
@@ -99,6 +125,17 @@ impl FakeServer {
             .insert(R::CONSTRUCTOR_ID, handler);
     }
 
+    /// Makes the next request that reaches a handler fail with `fault` instead (faults queue up, one per
+    /// request, in order). Service messages (pings, acks, containers) are never affected.
+    pub fn inject(&self, fault: Fault) {
+        self.state.lock().unwrap().faults.push_back(fault);
+    }
+
+    /// How many TCP connections have been accepted so far.
+    pub fn connections(&self) -> usize {
+        self.connections.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// The requests received so far, by type name.
     pub fn requests(&self) -> Vec<&'static str> {
         self.seen.lock().unwrap().clone()
@@ -123,6 +160,19 @@ impl FakeServer {
                     return;
                 };
                 for out in self.handle(&body, msg_id) {
+                    let out = match out {
+                        Out::Send(out) => out,
+                        Out::Raw(junk) => {
+                            let mut buf = DequeBuffer::with_capacity(junk.len(), 32);
+                            buf.extend_back(&junk);
+                            transport.pack(&mut buf);
+                            if sock.write_all(buf.as_ref()).await.is_err() {
+                                return;
+                            }
+                            continue;
+                        }
+                        Out::Close => return,
+                    };
                     msg_counter += 1;
                     let wire = encrypt(
                         &key,
@@ -143,7 +193,7 @@ impl FakeServer {
     }
 
     /// Plain bodies to send back for one decrypted message body.
-    fn handle(&self, body: &[u8], msg_id: i64) -> Vec<Vec<u8>> {
+    fn handle(&self, body: &[u8], msg_id: i64) -> Vec<Out> {
         let mut buf = tl::Cursor::from_slice(body);
         let id = u32::deserialize(&mut buf).unwrap_or(0);
         match id {
@@ -162,15 +212,54 @@ impl FakeServer {
                     .collect()
             }
             0x62d6b459 => vec![],
+            // get_future_salts -> future_salts: the client asks for more after a salt reset
+            0xb921bd04 => {
+                let num = i32::deserialize(&mut buf).unwrap_or(1).clamp(1, 64);
+                let now = now_secs() as i32;
+                // a bare message, not wrapped in rpc_result
+                let mut out = 0xae500895u32.to_bytes();
+                out.extend(msg_id.to_le_bytes());
+                out.extend(now.to_le_bytes());
+                // `vector<future_salt>` (lowercase) is bare: count, no constructor id
+                out.extend(num.to_le_bytes());
+                for i in 0..num {
+                    out.extend((now + i * 3600).to_le_bytes()); // valid_since
+                    out.extend((now + (i + 1) * 3600).to_le_bytes()); // valid_until
+                    out.extend((1000 + i64::from(i)).to_le_bytes()); // salt
+                }
+                vec![Out::Send(out)]
+            }
             // ping_delay_disconnect / ping -> pong
             0xf3427b8c | 0x7abe77ec => {
                 let ping_id = i64::deserialize(&mut buf).unwrap();
                 let mut out = 0x347773c5u32.to_bytes();
                 out.extend(msg_id.to_le_bytes());
                 out.extend(ping_id.to_le_bytes());
-                vec![out]
+                vec![Out::Send(out)]
             }
-            _ => vec![self.rpc(body, msg_id)],
+            _ => {
+                let fault = self.state.lock().unwrap().faults.pop_front();
+                match fault {
+                    None => vec![Out::Send(self.rpc(body, msg_id))],
+                    Some(Fault::Close) => vec![Out::Close],
+                    Some(Fault::Garbage) => vec![Out::Raw(vec![0x5a; 64])],
+                    Some(Fault::BadServerSalt { new_salt }) => {
+                        let mut out = 0xedab447bu32.to_bytes();
+                        out.extend(msg_id.to_le_bytes());
+                        out.extend(1i32.to_le_bytes()); // bad_msg_seqno
+                        out.extend(48i32.to_le_bytes());
+                        out.extend(new_salt.to_le_bytes());
+                        vec![Out::Send(out)]
+                    }
+                    Some(Fault::BadMsg { error_code }) => {
+                        let mut out = 0xa7eff811u32.to_bytes();
+                        out.extend(msg_id.to_le_bytes());
+                        out.extend(1i32.to_le_bytes());
+                        out.extend(error_code.to_le_bytes());
+                        vec![Out::Send(out)]
+                    }
+                }
+            }
         }
     }
 
