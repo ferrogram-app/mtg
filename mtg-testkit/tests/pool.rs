@@ -125,3 +125,71 @@ async fn garbage_from_the_server_does_not_hang_the_client() {
     );
     handle.quit();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn connector_falls_back_to_the_next_address_and_remembers_it() {
+    use mtg_session::Session;
+
+    let server = FakeServer::start().await;
+    let session = server.session();
+    // a closed port as the known address, the live server only in the stored list
+    let dead = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap()
+    };
+    let mut dc = session.dc_option(2).unwrap().unwrap();
+    let std::net::SocketAddr::V4(dead4) = dead else {
+        unreachable!()
+    };
+    dc.ipv4 = dead4;
+    session.set_dc_option(&dc).await.unwrap();
+    session
+        .set_dc_addresses(2, vec![dead, server.addr])
+        .await
+        .unwrap();
+
+    let pool = SenderPool::new(session.clone(), 1);
+    tokio::spawn(pool.runner.run());
+    let handle = pool.handle;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        handle.invoke_in_dc(2, &tl::functions::help::GetConfig {}),
+    )
+    .await
+    .expect("no answer")
+    .unwrap();
+
+    let std::net::SocketAddr::V4(live) = server.addr else {
+        unreachable!()
+    };
+    assert_eq!(session.dc_option(2).unwrap().unwrap().ipv4, live);
+    handle.quit();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn connector_reports_the_last_error_when_every_address_is_dead() {
+    use mtg_session::Session;
+
+    let server = FakeServer::start().await;
+    let session = server.session();
+    let dead = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap()
+    };
+    let mut dc = session.dc_option(2).unwrap().unwrap();
+    let std::net::SocketAddr::V4(dead4) = dead else {
+        unreachable!()
+    };
+    dc.ipv4 = dead4;
+    session.set_dc_option(&dc).await.unwrap();
+
+    let pool = SenderPool::new(session, 1);
+    tokio::spawn(pool.runner.run());
+    let err = pool
+        .handle
+        .invoke_in_dc(2, &tl::functions::help::GetConfig {})
+        .await
+        .unwrap_err();
+    assert!(matches!(err, InvocationError::Io(_)), "{err:?}");
+    pool.handle.quit();
+}

@@ -5,7 +5,13 @@ use mtg_session::types::DcOption;
 use mtg_tl_types::enums;
 use tracing::{error, warn};
 
+use std::net::SocketAddr;
+use std::time::Duration;
+
 use super::*;
+
+/// How long one address gets to produce a working connection before the next one is tried.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 impl SenderPoolRunner {
     pub(super) async fn process_request(&mut self, request: Request) -> ControlFlow<()> {
@@ -96,7 +102,12 @@ impl SenderPoolRunner {
             None => return Err(InvocationError::InvalidDc),
         };
 
-        let sender = self.connect_sender(&dc_option).await?;
+        let (sender, address) = self.connect_sender(&dc_option).await?;
+        // Remember the address that worked, so the next start tries it first.
+        match address {
+            SocketAddr::V4(a) => dc_option.ipv4 = a,
+            SocketAddr::V6(a) => dc_option.ipv6 = a,
+        }
 
         dc_option.auth_key = Some(sender.auth_key());
         self.session.set_dc_option(&dc_option).await?;
@@ -117,17 +128,61 @@ impl SenderPoolRunner {
         Ok(self.connections.last().unwrap())
     }
 
+    /// Tries the datacenter's addresses in turn (see [`candidates`]); returns the sender and the
+    /// address that worked.
     pub(super) async fn connect_sender(
         &mut self,
         dc_option: &DcOption,
-    ) -> Result<Sender<Box<dyn transport::Transport + Send>, mtp::Encrypted>, InvocationError> {
-        let transport = &self.connection_params.transport;
-
-        let address = if self.connection_params.use_ipv6 {
+    ) -> Result<
+        (
+            Sender<Box<dyn transport::Transport + Send>, mtp::Encrypted>,
+            SocketAddr,
+        ),
+        InvocationError,
+    > {
+        let use_ipv6 = self.connection_params.use_ipv6;
+        let primary: SocketAddr = if use_ipv6 {
             dc_option.ipv6.into()
         } else {
             dc_option.ipv4.into()
         };
+        let stored = self.session.dc_addresses(dc_option.id)?;
+        let mut last_error = InvocationError::Dropped("no address to connect to");
+        for address in candidates(primary, &stored, use_ipv6) {
+            let attempt = tokio::time::timeout(
+                CONNECT_TIMEOUT,
+                self.connect_one(address, dc_option.auth_key),
+            );
+            match attempt.await {
+                Ok(Ok((sender, config))) => {
+                    self.update_config(config).await?;
+                    return Ok((sender, address));
+                }
+                Ok(Err(e)) => {
+                    warn!(%address, error = %e, "could not connect; trying the next address");
+                    last_error = e;
+                }
+                Err(_) => {
+                    warn!(%address, "connection timed out; trying the next address");
+                    last_error = InvocationError::Io(std::io::ErrorKind::TimedOut.into());
+                }
+            }
+        }
+        Err(last_error)
+    }
+
+    async fn connect_one(
+        &self,
+        address: SocketAddr,
+        auth_key: Option<[u8; 256]>,
+    ) -> Result<
+        (
+            Sender<Box<dyn transport::Transport + Send>, mtp::Encrypted>,
+            tl::types::Config,
+        ),
+        InvocationError,
+    > {
+        let transport = &self.connection_params.transport;
 
         #[cfg(feature = "proxy")]
         let addr = || {
@@ -156,7 +211,7 @@ impl SenderPoolRunner {
             },
         };
 
-        let mut sender = if let Some(auth_key) = dc_option.auth_key {
+        let mut sender = if let Some(auth_key) = auth_key {
             connect_with_auth(transport(), addr(), auth_key)
                 .await
                 .map_err(InvocationError::Io)?
@@ -172,22 +227,26 @@ impl SenderPoolRunner {
             }
             Err(e) => return Err(e),
         };
-
-        self.update_config(remote_config).await?;
-
-        Ok(sender)
+        Ok((sender, remote_config))
     }
 
     pub(super) async fn update_config(
         &self,
         config: tl::types::Config,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut lists: std::collections::BTreeMap<i32, Vec<SocketAddr>> = Default::default();
         for option in config
             .dc_options
             .iter()
             .map(|tl::enums::DcOption::Option(option)| option)
             .filter(|option| !option.media_only && !option.tcpo_only && option.r#static)
         {
+            if let Some(address) = option_address(option) {
+                let list = lists.entry(option.id).or_default();
+                if !list.contains(&address) {
+                    list.push(address);
+                }
+            }
             let mut dc_option = self
                 .session
                 .dc_option(option.id)?
@@ -202,6 +261,11 @@ impl SenderPoolRunner {
                 continue;
             }
             self.session.set_dc_option(&dc_option).await?;
+        }
+        for (dc_id, list) in lists {
+            if self.session.dc_addresses(dc_id)? != list {
+                self.session.set_dc_addresses(dc_id, list).await?;
+            }
         }
         Ok(())
     }

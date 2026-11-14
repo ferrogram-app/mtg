@@ -28,7 +28,7 @@ use tracing::info;
 mod dc_option;
 mod run;
 
-use dc_option::merge_dc_option;
+use dc_option::{candidates, merge_dc_option, option_address};
 use run::run_sender;
 
 use crate::configuration::{ConnectionParams, RetryContext};

@@ -6,7 +6,7 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
 use mtg_session::types::DcOption;
 use mtg_tl_types as tl;
@@ -33,6 +33,28 @@ pub(super) fn merge_dc_option(dc_option: &mut DcOption, option: &tl::types::DcOp
         }
     }
     true
+}
+
+/// Address of `option` as a socket address; `None` if it does not parse or the port is invalid.
+pub(super) fn option_address(option: &tl::types::DcOption) -> Option<SocketAddr> {
+    let ip: IpAddr = option.ip_address.parse().ok()?;
+    Some(SocketAddr::new(ip, u16::try_from(option.port).ok()?))
+}
+
+/// Addresses to try for one datacenter, best first: the known-working `primary`, then the
+/// `stored` list, only of the wanted family and without repeats.
+pub(super) fn candidates(
+    primary: SocketAddr,
+    stored: &[SocketAddr],
+    use_ipv6: bool,
+) -> Vec<SocketAddr> {
+    let mut out = vec![primary];
+    for address in stored {
+        if address.is_ipv6() == use_ipv6 && !out.contains(address) {
+            out.push(*address);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -109,5 +131,24 @@ mod tests {
         assert!(!merge_dc_option(&mut dc, &tl_option(false, "2001::1", 443)));
         assert_eq!(dc.ipv4.port(), 0);
         assert_eq!(dc.ipv6.port(), 0);
+    }
+
+    #[test]
+    fn candidates_put_primary_first_and_filter_family() {
+        let p: SocketAddr = "1.1.1.1:443".parse().unwrap();
+        let a: SocketAddr = "2.2.2.2:443".parse().unwrap();
+        let v6: SocketAddr = "[::1]:443".parse().unwrap();
+        assert_eq!(candidates(p, &[a, p, a, v6], false), vec![p, a]);
+        assert_eq!(candidates(v6, &[a, p], true), vec![v6]);
+    }
+
+    #[test]
+    fn option_address_rejects_bad_input() {
+        assert_eq!(
+            option_address(&tl_option(false, "1.2.3.4", 443)),
+            Some("1.2.3.4:443".parse().unwrap())
+        );
+        assert_eq!(option_address(&tl_option(false, "nope", 443)), None);
+        assert_eq!(option_address(&tl_option(false, "1.2.3.4", -1)), None);
     }
 }
