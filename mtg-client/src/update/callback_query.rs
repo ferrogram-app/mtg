@@ -120,8 +120,7 @@ impl CallbackQuery {
                 ));
             }
         };
-        Ok(self
-            .client
+        self.client
             .get_messages_by_id(
                 self.peer_ref()
                     .await?
@@ -130,8 +129,8 @@ impl CallbackQuery {
             )
             .await?
             .pop()
-            .unwrap()
-            .unwrap())
+            .flatten()
+            .ok_or(InvocationError::Dropped("message no longer exists"))
     }
 
     /// Answer the callback query.

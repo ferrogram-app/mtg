@@ -72,7 +72,9 @@ impl Message {
         &self,
         mut medias: Vec<InputMedia>,
     ) -> Result<Vec<Option<Self>>, InvocationError> {
-        medias.first_mut().unwrap().reply_to = Some(self.id());
+        if let Some(first) = medias.first_mut() {
+            first.reply_to = Some(self.id());
+        }
         self.client
             .send_album(
                 self.peer_ref()
@@ -99,8 +101,12 @@ impl Message {
                     .await?
                     .ok_or(InvocationError::Dropped(NO_PEER_REF_REASON))?,
             )
-            .await
-            .map(|mut msgs| msgs.pop().unwrap().unwrap())
+            .await?
+            .pop()
+            .flatten()
+            .ok_or(InvocationError::Dropped(
+                "forwarded message is missing from the response",
+            ))
     }
 
     /// Edit this message to change its text or media.
@@ -195,10 +201,11 @@ impl Message {
     /// No changes will be made to the message if it fails to be fetched.
     ///
     /// Shorthand for `Client::get_messages_by_id`.
-    pub async fn refetch(&self) -> Result<(), InvocationError> {
+    pub async fn refetch(&mut self) -> Result<(), InvocationError> {
         // When fetching a single message, if it fails, Telegram should respond with RPC error.
-        // If it succeeds we will have the single message present which we can unwrap.
-        self.client
+        // A deleted message comes back as `None`.
+        let message = self
+            .client
             .get_messages_by_id(
                 self.peer_ref()
                     .await?
@@ -207,9 +214,10 @@ impl Message {
             )
             .await?
             .pop()
-            .unwrap()
-            .unwrap();
-        todo!("actually mutate self after get_messages_by_id returns `Message`")
+            .flatten()
+            .ok_or(InvocationError::Dropped("message no longer exists"))?;
+        *self = message;
+        Ok(())
     }
 
     /// Download the message media in this message if applicable.
