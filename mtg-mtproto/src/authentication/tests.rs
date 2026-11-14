@@ -235,3 +235,32 @@ fn emulate_successful_auth_key_gen_flow() -> Result<(), Error> {
 
     Ok(())
 }
+
+#[test]
+fn pq_must_be_exactly_eight_bytes() {
+    assert_eq!(parse_pq(&[0, 0, 0, 0, 0, 0, 1, 2]).unwrap(), 0x0102);
+    for len in [0, 7, 9] {
+        assert!(matches!(
+            parse_pq(&vec![1; len]),
+            Err(Error::InvalidPqSize { size }) if size == len
+        ));
+    }
+}
+
+#[test]
+fn p_and_q_are_sent_without_leading_zeros() {
+    assert_eq!(trimmed_be_bytes(0x0102), vec![1, 2]);
+    assert_eq!(trimmed_be_bytes(u64::MAX), vec![0xff; 8]);
+    assert_eq!(trimmed_be_bytes(0), vec![0; 8]); // nothing to trim, unchanged from before
+}
+
+#[test]
+fn only_a_fingerprint_we_hold_a_key_for_is_picked() {
+    assert!(matches!(
+        pick_key(&[1, 2]),
+        Err(Error::UnknownFingerprints { fingerprints }) if fingerprints == [1, 2]
+    ));
+    // the first fingerprint with a known key wins; unknown ones before it are skipped
+    let (fingerprint, _) = pick_key(&[1, -3414540481677951611, -5595554452916591101]).unwrap();
+    assert_eq!(fingerprint, -3414540481677951611);
+}

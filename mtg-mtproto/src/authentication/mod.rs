@@ -151,6 +151,33 @@ pub fn step2(
     res
 }
 
+/// Reads the big-endian `pq` the server sent; it must be exactly 8 bytes.
+fn parse_pq(bytes: &[u8]) -> Result<u64, Error> {
+    let buffer: [u8; 8] = bytes
+        .try_into()
+        .map_err(|_| Error::InvalidPqSize { size: bytes.len() })?;
+    Ok(u64::from_be_bytes(buffer))
+}
+
+/// Big-endian bytes of `n` without leading zeros: Telegram answers -404 to a padded `p`/`q`.
+fn trimmed_be_bytes(n: u64) -> Vec<u8> {
+    let bytes = n.to_be_bytes();
+    match bytes.iter().position(|&b| b != 0) {
+        Some(pos) => bytes[pos..].to_vec(),
+        None => bytes.to_vec(),
+    }
+}
+
+/// The first server fingerprint we hold a public key for, with that key.
+fn pick_key(fingerprints: &[i64]) -> Result<(i64, rsa::Key), Error> {
+    fingerprints
+        .iter()
+        .find_map(|&fingerprint| key_for_fingerprint(fingerprint).map(|key| (fingerprint, key)))
+        .ok_or_else(|| Error::UnknownFingerprints {
+            fingerprints: fingerprints.to_vec(),
+        })
+}
+
 fn do_step2(
     data: Step1,
     response: tl::enums::ResPq,
@@ -162,17 +189,7 @@ fn do_step2(
 
     check_nonce(&res_pq.nonce, &nonce)?;
 
-    if res_pq.pq.len() != 8 {
-        return Err(Error::InvalidPqSize {
-            size: res_pq.pq.len(),
-        });
-    }
-
-    let pq = {
-        let mut buffer = [0; 8];
-        buffer.copy_from_slice(&res_pq.pq);
-        u64::from_be_bytes(buffer)
-    };
+    let pq = parse_pq(&res_pq.pq)?;
 
     let (p, q) = factorize(pq).ok_or(Error::FactorizationFailed)?;
     let new_nonce = {
@@ -190,20 +207,8 @@ fn do_step2(
 
     // Convert (p, q) to bytes using the least amount of space possible.
     // If we don't do this, Telegram will respond with -404 as the message.
-    let p_bytes = {
-        let mut buffer = p.to_be_bytes().to_vec();
-        if let Some(pos) = buffer.iter().position(|&b| b != 0) {
-            buffer = buffer[pos..].to_vec();
-        }
-        buffer
-    };
-    let q_bytes = {
-        let mut buffer = q.to_be_bytes().to_vec();
-        if let Some(pos) = buffer.iter().position(|&b| b != 0) {
-            buffer = buffer[pos..].to_vec();
-        }
-        buffer
-    };
+    let p_bytes = trimmed_be_bytes(p);
+    let q_bytes = trimmed_be_bytes(q);
 
     // "pq is a representation of a natural number (in binary big endian format)"
     // https://core.telegram.org/mtproto/auth_key#dh-exchange-initiation
@@ -218,23 +223,7 @@ fn do_step2(
     .to_bytes();
 
     // sha_digest + data + random_bytes
-    let fingerprint = match res_pq
-        .server_public_key_fingerprints
-        .iter()
-        .cloned()
-        .find(|&fingerprint| key_for_fingerprint(fingerprint).is_some())
-    {
-        Some(x) => x,
-        None => {
-            return Err(Error::UnknownFingerprints {
-                fingerprints: res_pq.server_public_key_fingerprints.clone(),
-            });
-        }
-    };
-
-    let key = key_for_fingerprint(fingerprint).ok_or_else(|| Error::UnknownFingerprints {
-        fingerprints: res_pq.server_public_key_fingerprints.clone(),
-    })?;
+    let (fingerprint, key) = pick_key(&res_pq.server_public_key_fingerprints)?;
     let ciphertext = rsa::encrypt_hashed(&pq_inner_data, &key, &random_bytes);
 
     Ok((
@@ -285,6 +274,82 @@ pub fn step3(
     res
 }
 
+/// The error for a `server_DH_params_fail`; the security checks still run first, so a forged
+/// failure reports the check that tripped rather than `DhParamsFail`.
+fn dh_params_fail(
+    fail: &tl::types::ServerDhParamsFail,
+    nonce: &[u8; 16],
+    server_nonce: &[u8; 16],
+    new_nonce: &[u8; 32],
+) -> Error {
+    let checked = check_nonce(&fail.nonce, nonce)
+        .and_then(|()| check_server_nonce(&fail.server_nonce, server_nonce))
+        .and_then(|()| {
+            let sha = Sha1::digest(new_nonce);
+            let mut new_nonce_hash = [0; 16];
+            new_nonce_hash.copy_from_slice(&sha[4..20]);
+            check_new_nonce_hash(&fail.new_nonce_hash, &new_nonce_hash)
+        });
+    match checked {
+        Ok(()) => Error::DhParamsFail,
+        Err(error) => error,
+    }
+}
+
+/// Decrypts `encrypted_answer` (sha1 + `server_DH_inner_data` + padding) and checks its hash.
+fn decrypt_server_dh_inner(
+    mut encrypted_answer: Vec<u8>,
+    key: &[u8; 32],
+    iv: &[u8; 32],
+) -> Result<tl::types::ServerDhInnerData, Error> {
+    // 20 bytes of hash plus at least one block of data.
+    if !encrypted_answer.len().is_multiple_of(16) || encrypted_answer.len() < 32 {
+        return Err(Error::EncryptedResponseNotPadded {
+            len: encrypted_answer.len(),
+        });
+    }
+
+    mtg_crypto::aes::ige_decrypt(&mut encrypted_answer, key, iv);
+    let plain_text_answer = encrypted_answer;
+
+    let got_answer_hash: [u8; 20] = plain_text_answer[..20].try_into().unwrap();
+
+    // Use a cursor explicitly so we know where it ends (and most importantly
+    // where the padding starts).
+    let mut plain_text_cursor = Cursor::from_slice(&plain_text_answer[20..]);
+    let server_dh_inner = match tl::enums::ServerDhInnerData::deserialize(&mut plain_text_cursor) {
+        Ok(tl::enums::ServerDhInnerData::Data(x)) => x,
+        Err(error) => return Err(Error::InvalidDhInnerData { error }),
+    };
+
+    let expected_answer_hash: [u8; 20] =
+        Sha1::digest(&plain_text_answer[20..20 + plain_text_cursor.pos()]).into();
+
+    if got_answer_hash != expected_answer_hash {
+        return Err(Error::InvalidAnswerHash {
+            got: got_answer_hash,
+            expected: expected_answer_hash,
+        });
+    }
+    Ok(server_dh_inner)
+}
+
+/// Accepts the well-known prime and generator, otherwise requires `g` in 2..=7 and a safe prime.
+fn check_dh_params(inner: &tl::types::ServerDhInnerData) -> Result<(), Error> {
+    if inner.dh_prime != CURRENT_DH_PRIME || inner.g != CURRENT_G {
+        if !(2..=7).contains(&inner.g) {
+            return Err(Error::InvalidG(inner.g));
+        }
+
+        // An RNG failure inside the primality test counts as a rejected prime.
+        let dh_prime = BigUint::from_bytes_be(&inner.dh_prime);
+        if !check_dh_prime(&dh_prime, inner.g).unwrap_or(false) {
+            return Err(Error::InvalidDhPrime);
+        }
+    }
+    Ok(())
+}
+
 fn do_step3(
     data: Step2,
     response: tl::enums::ServerDhParams,
@@ -299,26 +364,14 @@ fn do_step3(
     let server_dh_params = response;
 
     // Step 3. Factorize PQ and construct the request for DH params.
-    let mut server_dh_params = match server_dh_params {
+    let server_dh_params = match server_dh_params {
         tl::enums::ServerDhParams::Fail(server_dh_params) => {
-            // Even though this is a failing case, we should still perform
-            // all the security checks.
-            check_nonce(&server_dh_params.nonce, &nonce)?;
-            check_server_nonce(&server_dh_params.server_nonce, &server_nonce)?;
-
-            let sha = {
-                let mut hasher = Sha1::new();
-                hasher.update(new_nonce);
-                hasher.finalize()
-            };
-            let new_nonce_hash = {
-                let mut buffer = [0; 16];
-                buffer.copy_from_slice(&sha[4..20]);
-                buffer
-            };
-            check_new_nonce_hash(&server_dh_params.new_nonce_hash, &new_nonce_hash)?;
-
-            return Err(Error::DhParamsFail);
+            return Err(dh_params_fail(
+                &server_dh_params,
+                &nonce,
+                &server_nonce,
+                &new_nonce,
+            ));
         }
         tl::enums::ServerDhParams::Ok(x) => x,
     };
@@ -326,63 +379,15 @@ fn do_step3(
     check_nonce(&server_dh_params.nonce, &nonce)?;
     check_server_nonce(&server_dh_params.server_nonce, &server_nonce)?;
 
-    // 20 bytes of hash plus at least one block of data.
-    if server_dh_params.encrypted_answer.len() % 16 != 0
-        || server_dh_params.encrypted_answer.len() < 32
-    {
-        return Err(Error::EncryptedResponseNotPadded {
-            len: server_dh_params.encrypted_answer.len(),
-        });
-    }
-
     // Complete DH Exchange
     let (key, iv) = mtg_crypto::generate_key_data_from_nonce(&server_nonce, &new_nonce);
-
-    // sha1 hash + plain text + padding
-    mtg_crypto::aes::ige_decrypt(&mut server_dh_params.encrypted_answer, &key, &iv);
-    let plain_text_answer = server_dh_params.encrypted_answer;
-
-    let got_answer_hash = {
-        let mut buffer = [0; 20];
-        buffer.copy_from_slice(&plain_text_answer[..20]);
-        buffer
-    };
-
-    // Use a cursor explicitly so we know where it ends (and most importantly
-    // where the padding starts).
-    let mut plain_text_cursor = Cursor::from_slice(&plain_text_answer[20..]);
-    let server_dh_inner = match tl::enums::ServerDhInnerData::deserialize(&mut plain_text_cursor) {
-        Ok(tl::enums::ServerDhInnerData::Data(x)) => x,
-        Err(error) => return Err(Error::InvalidDhInnerData { error }),
-    };
-
-    let expected_answer_hash = {
-        let mut hasher = Sha1::new();
-        hasher.update(&plain_text_answer[20..20 + plain_text_cursor.pos()]);
-        hasher.finalize().into()
-    };
-
-    if got_answer_hash != expected_answer_hash {
-        return Err(Error::InvalidAnswerHash {
-            got: got_answer_hash,
-            expected: expected_answer_hash,
-        });
-    }
+    let server_dh_inner = decrypt_server_dh_inner(server_dh_params.encrypted_answer, &key, &iv)?;
 
     check_nonce(&server_dh_inner.nonce, &nonce)?;
     check_server_nonce(&server_dh_inner.server_nonce, &server_nonce)?;
 
+    check_dh_params(&server_dh_inner)?;
     let dh_prime = BigUint::from_bytes_be(&server_dh_inner.dh_prime);
-    if server_dh_inner.dh_prime != CURRENT_DH_PRIME || server_dh_inner.g != CURRENT_G {
-        if !(2..=7).contains(&server_dh_inner.g) {
-            return Err(Error::InvalidG(server_dh_inner.g));
-        }
-
-        // An RNG failure inside the primality test counts as a rejected prime.
-        if !check_dh_prime(&dh_prime, server_dh_inner.g).unwrap_or(false) {
-            return Err(Error::InvalidDhPrime);
-        }
-    }
 
     // Safe to unwrap because the numbers are valid
     let g = BigUint::from(server_dh_inner.g as u32);
