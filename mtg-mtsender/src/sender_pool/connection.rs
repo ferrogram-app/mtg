@@ -140,6 +140,44 @@ impl SenderPoolRunner {
         ),
         InvocationError,
     > {
+        let result = self.connect_any(dc_option).await;
+        // Every known address failed: ask DNS for the fallback config once, then try again.
+        // shortcut: once per runner; add a cool-down if blocks come and go while running.
+        #[cfg(feature = "doh")]
+        if let (true, Some(domain), false) = (
+            result.is_err(),
+            self.connection_params.dns_fallback_domain.clone(),
+            self.dns_fallback_tried,
+        ) {
+            self.dns_fallback_tried = true;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs() as i32);
+            match crate::fallback::fetch_and_apply(&*self.session, &domain, "", now).await {
+                Ok(0) => warn!("the DNS fallback config gave no addresses"),
+                Ok(n) => {
+                    info!(
+                        datacenters = n,
+                        "got addresses from the DNS fallback config"
+                    );
+                    return self.connect_any(dc_option).await;
+                }
+                Err(err) => error!(%err, "could not store the DNS fallback addresses"),
+            }
+        }
+        result
+    }
+
+    async fn connect_any(
+        &mut self,
+        dc_option: &DcOption,
+    ) -> Result<
+        (
+            Sender<Box<dyn transport::Transport + Send>, mtp::Encrypted>,
+            SocketAddr,
+        ),
+        InvocationError,
+    > {
         let use_ipv6 = self.connection_params.use_ipv6;
         let primary: SocketAddr = if use_ipv6 {
             dc_option.ipv6.into()

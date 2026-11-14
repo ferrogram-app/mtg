@@ -8,7 +8,8 @@ Telegram documentation this crate implements:
 - [MTProto transports](https://core.telegram.org/mtproto/mtproto-transports) over TCP (optionally through a SOCKS5 proxy)
 - [Service messages](https://core.telegram.org/mtproto/service_messages) and
   [messages about messages](https://core.telegram.org/mtproto/service_messages_about_messages)
-- [Datacenters](https://core.telegram.org/api/datacenter): `dcOption`, migration between DCs
+- [Datacenters](https://core.telegram.org/api/datacenter): `dcOption`, migration between DCs; several addresses per DC are tried in turn, the last working one first
+- Fallback config for blocked datacenters: encrypted `help.configSimple` from DNS TXT records (`apply_dns_config`; with the `doh` feature and `ConnectionParams::dns_fallback_domain` the records are fetched over DNS-over-HTTPS), as the official client does
 - [Error handling](https://core.telegram.org/api/errors): RPC errors, flood waits
 
 The protocol itself is in `mtg-mtproto`; this crate only moves its bytes over sockets.

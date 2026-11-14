@@ -69,6 +69,13 @@ pub struct ConnectionParams {
     /// Builds the transport used for each new connection.
     pub transport: Box<TransportFactory>,
 
+    /// Domain whose DNS TXT records hold the fallback config (usually `apv3.stel.com`), asked
+    /// over DNS-over-HTTPS once when every known address of a datacenter failed.
+    ///
+    /// `None` (the default) makes no such request. Needs the `doh` feature; without it the
+    /// value is ignored.
+    pub dns_fallback_domain: Option<String>,
+
     #[doc(hidden)]
     pub __non_exhaustive: (),
 }
@@ -157,6 +164,7 @@ impl Default for ConnectionParams {
             // 100 is not zero
             updates_channel_capacity: NonZeroUsize::new(100).unwrap(),
             transport: Box::new(|| Box::new(transport::Full::new())),
+            dns_fallback_domain: None,
             __non_exhaustive: (),
         }
     }

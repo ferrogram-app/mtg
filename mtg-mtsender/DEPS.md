@@ -69,3 +69,12 @@ SOCKS5 proxy support.
 ## socks5-server
 
 Used to test for SOCKS5 proxy support.
+
+## ureq
+
+Optional (`doh` feature). Blocking HTTPS client for the DNS-over-HTTPS lookup of the fallback config
+(`fallback/doh.rs`), run on a blocking thread. Chosen over `reqwest` to keep the dependency tree small.
+
+## serde_json
+
+Optional (`doh` feature). Parses the JSON answer of the DNS-over-HTTPS resolvers.

@@ -121,6 +121,8 @@ pub struct SenderPoolRunner {
     request_rx: mpsc::UnboundedReceiver<Request>,
     updates_tx: mpsc::Sender<UpdatesLike>,
     connections: Vec<ConnectionInfo>,
+    #[cfg(feature = "doh")]
+    dns_fallback_tried: bool,
     connection_pool: JoinSet<Result<(), ReadError>>,
 }
 
@@ -286,6 +288,8 @@ impl SenderPool {
                 request_rx,
                 updates_tx,
                 connections: Vec::new(),
+                #[cfg(feature = "doh")]
+                dns_fallback_tried: false,
                 connection_pool: JoinSet::new(),
             },
             handle: SenderPoolFatHandle {

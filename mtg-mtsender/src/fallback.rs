@@ -115,7 +115,7 @@ pub fn phone_allowed(rules: &str, phone: &str) -> bool {
 ///
 /// Returns how many datacenters were updated; `0` if the records do not decode or the config is
 /// not valid at `now`.
-pub async fn apply_dns_config<S: Session>(
+pub async fn apply_dns_config<S: Session + ?Sized>(
     session: &S,
     txt_chunks: Vec<String>,
     phone: &str,
@@ -124,7 +124,7 @@ pub async fn apply_dns_config<S: Session>(
     apply_with_key(session, txt_chunks, phone, now, &config_simple_key()).await
 }
 
-async fn apply_with_key<S: Session>(
+async fn apply_with_key<S: Session + ?Sized>(
     session: &S,
     txt_chunks: Vec<String>,
     phone: &str,
@@ -152,6 +152,21 @@ async fn apply_with_key<S: Session>(
         updated += 1;
     }
     Ok(updated)
+}
+
+#[cfg(feature = "doh")]
+pub mod doh;
+
+/// Fetches the TXT records of `domain` over DNS-over-HTTPS and applies them (see
+/// [`apply_dns_config`]).
+#[cfg(feature = "doh")]
+pub async fn fetch_and_apply<S: Session + ?Sized>(
+    session: &S,
+    domain: &str,
+    phone: &str,
+    now: i32,
+) -> Result<usize, S::Error> {
+    apply_dns_config(session, doh::fetch_txt(domain).await, phone, now).await
 }
 
 #[cfg(test)]

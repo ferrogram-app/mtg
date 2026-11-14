@@ -39,6 +39,8 @@ pub use errors::{InvocationError, ReadError, RpcError};
 pub use fallback::{
     AccessRule, SimpleConfig, apply_dns_config, decode_txt, parse_simple_config, phone_allowed,
 };
+#[cfg(feature = "doh")]
+pub use fallback::{doh, fetch_and_apply};
 pub use net::ServerAddr;
 pub use sender::{Sender, connect, connect_with_auth, generate_auth_key};
 pub use sender_pool::{SenderPool, SenderPoolFatHandle, SenderPoolHandle, SenderPoolRunner};
