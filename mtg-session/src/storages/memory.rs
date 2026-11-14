@@ -6,7 +6,9 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
+use std::collections::HashMap;
 use std::fmt;
+use std::net::SocketAddr;
 use std::sync::{Mutex, MutexGuard};
 
 use crate::types::{ChannelState, DcOption, PeerId, PeerInfo, UpdateState, UpdatesState};
@@ -20,13 +22,13 @@ use crate::{BoxFuture, Session, SessionData};
 /// Logging in has a very high cost in terms of flood wait errors,
 /// so the state really should be persisted by other means.
 #[derive(Default)]
-pub struct MemorySession(Mutex<SessionData>);
+pub struct MemorySession(Mutex<SessionData>, Mutex<HashMap<i32, Vec<SocketAddr>>>);
 
 impl From<SessionData> for MemorySession {
     /// Constructs a memory session from the entirety of the session data,
     /// unlike the blanket `From` implementation which cannot import all values
     fn from(session_data: SessionData) -> Self {
-        Self(Mutex::new(session_data))
+        Self(Mutex::new(session_data), Mutex::default())
     }
 }
 
@@ -80,6 +82,23 @@ impl Session for MemorySession {
         })
     }
 
+    fn dc_addresses(&self, dc_id: i32) -> Result<Vec<SocketAddr>, MemorySessionError> {
+        let map = self.1.lock().map_err(|_| MemorySessionError::Poisoned)?;
+        Ok(map.get(&dc_id).cloned().unwrap_or_default())
+    }
+
+    fn set_dc_addresses(
+        &self,
+        dc_id: i32,
+        addresses: Vec<SocketAddr>,
+    ) -> BoxFuture<'_, Result<(), MemorySessionError>> {
+        Box::pin(async move {
+            let mut map = self.1.lock().map_err(|_| MemorySessionError::Poisoned)?;
+            map.insert(dc_id, addresses);
+            Ok(())
+        })
+    }
+
     fn peer(&self, peer: PeerId) -> BoxFuture<'_, Result<Option<PeerInfo>, MemorySessionError>> {
         Box::pin(async move { Ok(self.data()?.peer_infos.get(&peer).cloned()) })
     }
@@ -126,5 +145,19 @@ impl Session for MemorySession {
 
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn dc_addresses_roundtrip() {
+        let s = MemorySession::default();
+        assert!(s.dc_addresses(1).unwrap().is_empty());
+        let a: SocketAddr = "1.1.1.1:443".parse().unwrap();
+        s.set_dc_addresses(1, vec![a]).await.unwrap();
+        assert_eq!(s.dc_addresses(1).unwrap(), vec![a]);
     }
 }

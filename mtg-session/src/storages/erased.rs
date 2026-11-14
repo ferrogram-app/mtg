@@ -64,6 +64,25 @@ where
         })
     }
 
+    fn dc_addresses(&self, dc_id: i32) -> Result<Vec<std::net::SocketAddr>, Self::Error> {
+        Arc::clone(&self.0)
+            .dc_addresses(dc_id)
+            .map_err(|e| e.into())
+    }
+
+    fn set_dc_addresses(
+        &self,
+        dc_id: i32,
+        addresses: Vec<std::net::SocketAddr>,
+    ) -> BoxFuture<'_, Result<(), Self::Error>> {
+        Box::pin(async move {
+            Arc::clone(&self.0)
+                .set_dc_addresses(dc_id, addresses)
+                .await
+                .map_err(|e| e.into())
+        })
+    }
+
     fn peer(&self, peer: PeerId) -> BoxFuture<'_, Result<Option<PeerInfo>, Self::Error>> {
         Box::pin(async move { Arc::clone(&self.0).peer(peer).await.map_err(|e| e.into()) })
     }

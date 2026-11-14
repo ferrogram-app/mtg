@@ -6,6 +6,8 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
+use std::net::SocketAddr;
+
 use crate::BoxFuture;
 use crate::peer::PeerRef;
 use crate::types::{DcOption, PeerId, PeerInfo, UpdateState, UpdatesState};
@@ -51,6 +53,24 @@ pub trait Session: Send + Sync + 'static {
     ///
     /// This must update the value in the cache layer used by `dc_option`.
     fn set_dc_option(&self, dc_option: &DcOption) -> BoxFuture<'_, Result<(), Self::Error>>;
+
+    /// Extra addresses known for a datacenter, in order of preference, besides the single
+    /// IPv4 and IPv6 address of its [`Session::dc_option`]. Both families may be mixed.
+    ///
+    /// Storages that do not remember them return nothing (the default), which leaves the
+    /// sender pool with the addresses it learns during its own run.
+    fn dc_addresses(&self, _dc_id: i32) -> Result<Vec<SocketAddr>, Self::Error> {
+        Ok(Vec::new())
+    }
+
+    /// Replace the [`Session::dc_addresses`] of a datacenter. The default does not remember them.
+    fn set_dc_addresses(
+        &self,
+        _dc_id: i32,
+        _addresses: Vec<SocketAddr>,
+    ) -> BoxFuture<'_, Result<(), Self::Error>> {
+        Box::pin(async { Ok(()) })
+    }
 
     /// Query a peer by its identity.
     ///

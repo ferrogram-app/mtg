@@ -7,6 +7,7 @@
 // except according to those terms.
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -28,6 +29,7 @@ pub use error::SqliteSessionError;
 struct Cache {
     pub home_dc: i32,
     pub dc_options: HashMap<i32, DcOption>,
+    pub dc_addresses: HashMap<i32, Vec<SocketAddr>>,
 }
 
 /// SQLite-based storage. This is the recommended option.
@@ -81,11 +83,24 @@ impl SqliteSession {
             .map(|dc_option| (dc_option.id, dc_option))
             .collect();
 
+        let mut dc_addresses: HashMap<i32, Vec<SocketAddr>> = HashMap::new();
+        for (dc_id, address) in db
+            .fetch_all(
+                "SELECT dc_id, address FROM dc_address ORDER BY dc_id, position",
+                named_params![],
+                |row| Ok((row.get::<i32>(0)?, row.get::<String>(1)?.parse()?)),
+            )
+            .await?
+        {
+            dc_addresses.entry(dc_id).or_default().push(address);
+        }
+
         Ok(SqliteSession {
             database: AsyncMutex::new(db),
             cache: Mutex::new(Cache {
                 home_dc,
                 dc_options,
+                dc_addresses,
             }),
         })
     }
@@ -166,6 +181,58 @@ impl Session for SqliteSession {
                 },
             )
             .await?;
+            Ok(())
+        })
+    }
+
+    fn dc_addresses(&self, dc_id: i32) -> Result<Vec<SocketAddr>, SqliteSessionError> {
+        Ok(self
+            .cache
+            .lock()
+            .map_err(|_| SqliteSessionError::Poisoned)?
+            .dc_addresses
+            .get(&dc_id)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    fn set_dc_addresses(
+        &self,
+        dc_id: i32,
+        addresses: Vec<SocketAddr>,
+    ) -> BoxFuture<'_, Result<(), SqliteSessionError>> {
+        let ok = match self.cache.lock() {
+            Err(_) => Err(SqliteSessionError::Poisoned),
+            Ok(mut x) => {
+                x.dc_addresses.insert(dc_id, addresses.clone());
+                Ok(())
+            }
+        };
+
+        Box::pin(async move {
+            ok?;
+
+            let db = self.database.lock().await;
+            let transaction = db.begin_transaction().await?;
+            transaction
+                .execute(
+                    "DELETE FROM dc_address WHERE dc_id = :dc_id",
+                    named_params! {":dc_id": dc_id},
+                )
+                .await?;
+            for (position, address) in addresses.iter().enumerate() {
+                transaction
+                    .execute(
+                        "INSERT INTO dc_address VALUES (:dc_id, :position, :address)",
+                        named_params! {
+                            ":dc_id": dc_id,
+                            ":position": position as i64,
+                            ":address": address.to_string(),
+                        },
+                    )
+                    .await?;
+            }
+            transaction.commit().await?;
             Ok(())
         })
     }

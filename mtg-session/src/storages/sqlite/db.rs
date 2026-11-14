@@ -11,7 +11,7 @@ use libsql::params;
 use super::SqliteSessionError;
 
 /// Schema version stored in `PRAGMA user_version`.
-pub(super) const VERSION: i64 = 1;
+pub(super) const VERSION: i64 = 2;
 
 pub(super) struct Database(pub(super) libsql::Connection);
 
@@ -27,6 +27,10 @@ impl Database {
 
         if user_version == 0 {
             self.migrate_v0_to_v1().await?;
+            user_version += 1;
+        }
+        if user_version == 1 {
+            self.migrate_v1_to_v2().await?;
             user_version += 1;
         }
         if user_version == VERSION {
@@ -90,6 +94,21 @@ impl Database {
             .await?;
 
         transaction.commit().await?;
+        Ok(())
+    }
+
+    /// Adds the ordered list of extra datacenter addresses.
+    pub(super) async fn migrate_v1_to_v2(&self) -> libsql::Result<()> {
+        self.0
+            .execute(
+                "CREATE TABLE dc_address (
+                dc_id INTEGER NOT NULL,
+                position INTEGER NOT NULL,
+                address TEXT NOT NULL,
+                PRIMARY KEY (dc_id, position))",
+                params![],
+            )
+            .await?;
         Ok(())
     }
 

@@ -179,3 +179,26 @@ async fn do_exercise_sqlite_session() {
         }
     );
 }
+
+#[tokio::test]
+async fn dc_addresses_are_ordered_and_persisted() {
+    let path = std::env::temp_dir().join(format!("mtg-dc-addr-{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let list: Vec<std::net::SocketAddr> =
+        vec!["1.2.3.4:443".parse().unwrap(), "[::1]:80".parse().unwrap()];
+    {
+        let session = SqliteSession::open(path.to_str().unwrap()).await.unwrap();
+        assert!(session.dc_addresses(2).unwrap().is_empty());
+        session.set_dc_addresses(2, list.clone()).await.unwrap();
+        session
+            .set_dc_addresses(2, list.iter().rev().cloned().collect())
+            .await
+            .unwrap();
+        assert_eq!(session.dc_addresses(2).unwrap(), vec![list[1], list[0]]);
+    }
+    let session = SqliteSession::open(path.to_str().unwrap()).await.unwrap();
+    assert_eq!(session.dc_addresses(2).unwrap(), vec![list[1], list[0]]);
+    assert!(session.dc_addresses(3).unwrap().is_empty());
+    drop(session);
+    let _ = std::fs::remove_file(&path);
+}
