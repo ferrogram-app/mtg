@@ -123,6 +123,56 @@ pub fn encrypt_hashed(data: &[u8], key: &Key, random_bytes: &[u8; 224]) -> Vec<u
     block
 }
 
+/// The RSA key that signs `help.configSimple` (the fallback config served through DNS, see
+/// `ConnectionsManager::decodeSimpleConfig` in the official client).
+pub fn config_simple_key() -> Key {
+    // Built from constants, which are valid decimal numbers.
+    Key::new(
+        "25594673677667620809906786596201307389551981417798428001869244604459429464878069196143782435208874919356695733541988103826593317882032589410549705427376395715741122635705196279462384209474724464739808233875090021376372573984621331707619020338278677849257179003522211669653520497011026463759018571836171412743838333545643124524738668336337407784017912929013105207540563238048508839151666097149972013206030244035495945218846612846135429832280322229948223099970250174729037221177731101114517641547287444519942815225091899265154668746316731660795947127337188464441628954070640022109333834186044802246880537741218439076039",
+        "65537",
+    )
+    .expect("valid built-in key")
+}
+
+/// Decrypts a 256-byte `help.configSimple` block: RSA public operation, then AES-256-CBC (key =
+/// the first 32 bytes, IV = bytes 16..32), then a check of the SHA-256 prefix and of the length.
+///
+/// Returns the TL bytes (the boxed `help.configSimple` followed by padding), or `None` if the
+/// input is not exactly 256 bytes or does not verify.
+pub fn decrypt_config_simple(data: &[u8], key: &Key) -> Option<Vec<u8>> {
+    #[allow(deprecated)] // see aes.rs
+    use ::aes::Aes256;
+    use ::aes::cipher::{BlockCipherDecrypt, KeyInit};
+
+    let data: &[u8; 256] = data.try_into().ok()?;
+    let x = BigUint::from_bytes_be(data);
+    if x >= key.n {
+        return None;
+    }
+    let mut block = [0u8; 256];
+    let y = x.modpow(&key.e, &key.n).to_bytes_be();
+    block[256 - y.len()..].copy_from_slice(&y);
+
+    let key_bytes: [u8; 32] = block[..32].try_into().ok()?;
+    let cipher = Aes256::new((&key_bytes).into());
+    let mut previous: [u8; 16] = block[16..32].try_into().ok()?;
+    for chunk in block[32..].chunks_exact_mut(16) {
+        let ciphertext: [u8; 16] = (&*chunk).try_into().ok()?;
+        cipher.decrypt_block(chunk.try_into().ok()?);
+        chunk.iter_mut().zip(previous).for_each(|(a, b)| *a ^= b);
+        previous = ciphertext;
+    }
+
+    if sha256!(&block[32..240])[..16] != block[240..] {
+        return None;
+    }
+    let len = u32::from_le_bytes(block[32..36].try_into().ok()?) as usize;
+    if len == 0 || len > 208 || len % 4 != 0 {
+        return None;
+    }
+    Some(block[36..240].to_vec())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -179,5 +229,27 @@ mod tests {
     fn key_new_rejects_garbage() {
         assert!(Key::new("12x", "3").is_none());
         assert!(Key::new("12", "y").is_none());
+    }
+
+    fn test_key() -> Key {
+        Key::new("26360479295147871824782658357491182307227121528708014011596960955894901234742328402268014007534461846441587175359765711681630519187985656428713166218544195882430183611415197510978818801471033458758082613354100358222247889266057503674521881696873629558346000131569307477882726288560062593584818776265756508366972272561340805920766845269289917316403629106226742643055365870307644783354590924378934953749617466494856748949612285348677016470393110602600407880600891558359929121830506732354632945222831189948253079003235824485756355882567858777529290924007334611720548432089925776267081896912757733805759267885119347456031", "65537").unwrap()
+    }
+
+    #[test]
+    fn config_simple_block_is_decrypted_and_verified() {
+        let good = hex::from_hex(
+            "46e903a0f832aeaa9e20c10335432f7203a90af67e7e7ab697224814888e8e0b9003a72a0871793e350707bd49ef38bd615ba5539a008a2f4792b75fcec5a70afb07fd71dd8a07435af65b90b2f5f1f1b4c1c172633d99bd4a940fe79d22cff4afbb9540806fb27f02f3b4c96644ef72de933fa81e0f23531903dd8676801a2dc3b7191390753c9581b0fd532684ed9fcbace780bd544dcd5a228361e727a19c6f59ab5307020734a4b3297fa41f861f2bba267f39d3c31a4d99456b6d922fea2ffa1f0e5fb524b962cf5fdd23d66c4c2f5f84843fa241b0d41cd13acdcc64aebeb0ea3ad2f26c95d974c98ed9d234faaa0fcbf04d9e6d482440fb9d071fe743",
+        );
+        let out = decrypt_config_simple(&good, &test_key()).unwrap();
+        assert_eq!(&out[..12], &[0xde, 0xad, 0xbe, 0xef].repeat(3)[..]);
+
+        let bad_hash = hex::from_hex(
+            "caeec9bc5c1c02be8f6e0cae327729c5df22ca2020ec641cae1bb6f76ae2ba7c0aa769dce9c9fde34cac37230660aa33d65779ad49135315a01cdb73e0534c51ff9adf38c032706d61eabcacaa1afba72e9fdbf1dbf01e382c0c992da127f38fcb9a9cfaca4d27ce3419edd6618749aedfaf6d20635dbb62db11a1fb1233ada9dc4505ef1b69e05ef8e54a4a7226b2e3665c4e5fb99deedbe25dbfe33b747f8a96b27601bbf860bc78a859fdd9a1d0a5721071df205ae58028f95670ae9b1cc9869696d1bdac0a499f51db05cc4340a96528c233f981b5cd140effebe2ecdfec080bbeb4e157abca4ace9ccb2ab7d10c49ebc9c7cbb75bdb0853455b7550b9df",
+        );
+        assert!(decrypt_config_simple(&bad_hash, &test_key()).is_none());
+        assert!(decrypt_config_simple(&good[..255], &test_key()).is_none());
+        assert!(decrypt_config_simple(&[0xff; 256], &test_key()).is_none());
+        // the real key does not verify a block signed with another one
+        assert!(decrypt_config_simple(&good, &config_simple_key()).is_none());
     }
 }
