@@ -180,7 +180,14 @@ impl<T: Transport, M: mtp::Mtp> Sender<T, M> {
                     if pair.msg_id == bad_msg.msg_id || pair.container_msg_id == bad_msg.msg_id =>
                 {
                     // TODO add a test to make sure we resend the request
-                    if bad_msg.retryable() {
+                    if bad_msg.retryable() && self.requests[i].resends >= MAX_BAD_MSG_RESENDS {
+                        // a server that keeps rejecting the same request must not loop us forever
+                        warn!(request = ?pair.msg_id, "{}; too many resends", bad_msg.description());
+                        let req = self.requests.swap_remove(i);
+                        drop(req.result.send(Err(InvocationError::Dropped(
+                            "too many bad_msg resends",
+                        ))));
+                    } else if bad_msg.retryable() {
                         info!(
                             request = ?pair.msg_id,
                             "{}; re-sending request",
@@ -189,6 +196,7 @@ impl<T: Transport, M: mtp::Mtp> Sender<T, M> {
 
                         // TODO check if actually retryable first!
                         self.requests[i].state = RequestState::NotSerialized;
+                        self.requests[i].resends += 1;
                     } else {
                         if bad_msg.fatal() {
                             error!(

@@ -244,6 +244,11 @@ impl Encrypted {
         self.auth_key.to_bytes()
     }
 
+    /// Seconds to add to the local clock to get the server's time, as learned so far.
+    pub fn current_time_offset(&self) -> i32 {
+        self.time_offset
+    }
+
     /// Correct our time offset based on a known valid message ID, as the official client does:
     /// the server stamped the message about half a round trip ago.
     fn correct_time_offset(&mut self, msg_id: i64) {

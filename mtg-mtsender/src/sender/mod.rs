@@ -73,9 +73,15 @@ pub struct Sender<T: Transport, M: mtp::Mtp> {
     next_ping: Instant,
 }
 
+/// How many times one request is resent after retryable `bad_msg_notification`s before it fails:
+/// a server that keeps rejecting it will not change its mind.
+const MAX_BAD_MSG_RESENDS: u8 = 5;
+
 struct Request {
     body: Vec<u8>,
     state: RequestState,
+    /// Resends caused by `bad_msg_notification`.
+    resends: u8,
     result: oneshot::Sender<Result<Vec<u8>, InvocationError>>,
 }
 
@@ -97,6 +103,13 @@ impl MsgIdPair {
             msg_id,
             container_msg_id: msg_id, // by default, no container (so the last msg_id is itself)
         }
+    }
+}
+
+impl<T: Transport> Sender<T, mtp::Encrypted> {
+    /// Seconds to add to the local clock to get the server's time, as learned from the server.
+    pub fn time_offset(&self) -> i32 {
+        self.state.mtp.current_time_offset()
     }
 }
 
@@ -158,6 +171,7 @@ impl<T: Transport, M: mtp::Mtp> Sender<T, M> {
         self.requests.push(Request {
             body,
             state: RequestState::NotSerialized,
+            resends: 0,
             result: tx,
         });
     }
@@ -343,6 +357,7 @@ mod tests {
         sender.requests.push(Request {
             body: vec![0; 8],
             state: RequestState::Serialized(MsgIdPair::new(MsgId::from_raw(id))),
+            resends: 0,
             result,
         });
     }
@@ -374,6 +389,7 @@ mod tests {
         sender.requests.push(Request {
             body: vec![0; 8],
             state: RequestState::Sent(MsgIdPair::new(MsgId::from_raw(id))),
+            resends: 0,
             result,
         });
         rx
@@ -393,6 +409,28 @@ mod tests {
                 "{code}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_request_the_server_keeps_rejecting_is_dropped_after_the_resend_cap() {
+        let (mut s, _l) = sender().await;
+        let mut rx = sent(&mut s, 4);
+        for round in 0..=MAX_BAD_MSG_RESENDS {
+            s.process_bad_message(mtp::BadMessage {
+                msg_id: MsgId::from_raw(4),
+                code: 16,
+            });
+            if round < MAX_BAD_MSG_RESENDS {
+                assert!(matches!(s.requests[0].state, RequestState::NotSerialized));
+                // pretend it went out again under the same id
+                s.requests[0].state = RequestState::Sent(MsgIdPair::new(MsgId::from_raw(4)));
+            }
+        }
+        assert!(s.requests.is_empty());
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Err(InvocationError::Dropped("too many bad_msg resends")))
+        ));
     }
 
     #[tokio::test]
@@ -440,6 +478,7 @@ mod tests {
                 } else {
                     RequestState::Serialized(pair)
                 },
+                resends: 0,
                 result,
             });
         }
