@@ -33,3 +33,28 @@ macro_rules! sha256 (
         sha
     })
 );
+
+/// HMAC-SHA256 of `data` under `key` (used by the fake-TLS MTProxy handshake).
+pub fn hmac_sha256(key: &[u8], data: &[&[u8]]) -> [u8; 32] {
+    use hmac::{Hmac, KeyInit, Mac};
+    let mut mac = <Hmac<sha2::Sha256> as KeyInit>::new_from_slice(key).expect("any key length");
+    for part in data {
+        mac.update(part);
+    }
+    mac.finalize().into_bytes().into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::hmac_sha256;
+
+    #[test]
+    fn rfc4231_case_2() {
+        // key "Jefe", data "what do ya want for nothing?"
+        let mac = hmac_sha256(b"Jefe", &[b"what do ya want ", b"for nothing?"]);
+        assert_eq!(
+            crate::hex::to_hex(&mac),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+    }
+}
