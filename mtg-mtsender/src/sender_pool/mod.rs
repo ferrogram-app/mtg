@@ -6,26 +6,24 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 use std::num::NonZeroU32;
 use std::ops::{ControlFlow, Deref};
 use std::sync::Arc;
 use std::time::Duration;
 use std::{fmt, panic};
 
-use mtg_mtproto::{MAX_REQUEST_SIZE, mtp, transport};
+use mtg_mtproto::MAX_REQUEST_SIZE;
 use mtg_session::Session;
 use mtg_session::storages::{ErasedSession, erase};
-use mtg_session::types::DcOption;
 use mtg_session::updates::UpdatesLike;
-use mtg_tl_types::{self as tl, Deserializable, enums};
+use mtg_tl_types::{self as tl, Deserializable};
 use tokio::task::AbortHandle;
 use tokio::{
     sync::{mpsc, oneshot},
     task::JoinSet,
     time::sleep,
 };
-use tracing::{error, info, warn};
+use tracing::info;
 
 mod dc_option;
 mod run;
@@ -36,6 +34,8 @@ use run::run_sender;
 use crate::configuration::{ConnectionParams, RetryContext};
 use crate::errors::{InvocationError, ReadError};
 use crate::{Sender, ServerAddr, connect, connect_with_auth};
+
+mod connection;
 
 /// How long to wait after warning the user that the updates was dropped.
 type InvokeResponse = Vec<u8>;
@@ -333,201 +333,6 @@ impl SenderPoolRunner {
         self.connections.clear(); // drop all channels to cause the `run_sender` loops to stop
         self.connection_pool.join_all().await;
     }
-
-    async fn process_request(&mut self, request: Request) -> ControlFlow<()> {
-        match request {
-            Request::Invoke { dc_id, body, tx } => {
-                let connection = match self
-                    .connections
-                    .iter()
-                    .find(|connection| connection.dc_id == dc_id)
-                {
-                    Some(connection) => connection,
-                    None => match self.create_connection(dc_id).await {
-                        Ok(x) => x,
-                        Err(e) => {
-                            let _ = tx.send(Err(e));
-                            return ControlFlow::Continue(());
-                        }
-                    },
-                };
-                let _ = connection.rpc_tx.send(Rpc { body, tx });
-                ControlFlow::Continue(())
-            }
-            Request::CheckRetry {
-                dc_id,
-                error,
-                fail_count,
-                slept_so_far,
-                tx,
-            } => {
-                if is_auth_key_duplicated(&error) {
-                    self.forget_auth_key(dc_id).await;
-                }
-                let retry_context = RetryContext {
-                    fail_count,
-                    slept_so_far,
-                    error,
-                };
-                let flow = match self
-                    .connection_params
-                    .retry_policy
-                    .should_retry(&retry_context)
-                {
-                    ControlFlow::Continue(delay) => ControlFlow::Continue(delay),
-                    ControlFlow::Break(()) => ControlFlow::Break(retry_context.error),
-                };
-                let _ = tx.send(flow);
-                ControlFlow::Continue(())
-            }
-            Request::Disconnect { dc_id } => {
-                self.connections.retain(|connection| {
-                    if connection.dc_id == dc_id {
-                        connection.abort_handle.abort();
-                        false
-                    } else {
-                        true
-                    }
-                });
-                ControlFlow::Continue(())
-            }
-            Request::Quit => ControlFlow::Break(()),
-        }
-    }
-
-    /// The server invalidated our key (`AUTH_KEY_DUPLICATED`, the key was used from two
-    /// connections): forget it and drop the connection, so the next request makes a new key.
-    async fn forget_auth_key(&mut self, dc_id: i32) {
-        warn!(dc_id, "auth key was invalidated by the server; dropping it");
-        self.connections.retain(|connection| {
-            if connection.dc_id == dc_id {
-                connection.abort_handle.abort();
-            }
-            connection.dc_id != dc_id
-        });
-        if let Ok(Some(mut dc_option)) = self.session.dc_option(dc_id) {
-            dc_option.auth_key = None;
-            if let Err(err) = self.session.set_dc_option(&dc_option).await {
-                error!(%err, "could not forget the invalidated auth key");
-            }
-        }
-    }
-
-    async fn create_connection(&mut self, dc_id: i32) -> Result<&ConnectionInfo, InvocationError> {
-        let mut dc_option = match self.session.dc_option(dc_id)? {
-            Some(x) => x,
-            None => return Err(InvocationError::InvalidDc),
-        };
-
-        let sender = self.connect_sender(&dc_option).await?;
-
-        dc_option.auth_key = Some(sender.auth_key());
-        self.session.set_dc_option(&dc_option).await?;
-
-        let (rpc_tx, rpc_rx) = mpsc::unbounded_channel();
-        let abort_handle = self.connection_pool.spawn(run_sender(
-            sender,
-            rpc_rx,
-            self.updates_tx.clone(),
-            dc_option.id == self.session.home_dc_id()?,
-        ));
-        self.connections.push(ConnectionInfo {
-            dc_id,
-            rpc_tx,
-            abort_handle,
-        });
-        // just pushed above
-        Ok(self.connections.last().unwrap())
-    }
-
-    async fn connect_sender(
-        &mut self,
-        dc_option: &DcOption,
-    ) -> Result<Sender<Box<dyn transport::Transport + Send>, mtp::Encrypted>, InvocationError> {
-        let transport = &self.connection_params.transport;
-
-        let address = if self.connection_params.use_ipv6 {
-            dc_option.ipv6.into()
-        } else {
-            dc_option.ipv4.into()
-        };
-
-        #[cfg(feature = "proxy")]
-        let addr = || {
-            if let Some(proxy) = self.connection_params.proxy_url.clone() {
-                ServerAddr::Proxied { address, proxy }
-            } else {
-                ServerAddr::Tcp { address }
-            }
-        };
-        #[cfg(not(feature = "proxy"))]
-        let addr = || ServerAddr::Tcp { address };
-
-        let init_connection = tl::functions::InvokeWithLayer {
-            layer: tl::LAYER,
-            query: tl::functions::InitConnection {
-                api_id: self.api_id,
-                device_model: self.connection_params.device_model.clone(),
-                system_version: self.connection_params.system_version.clone(),
-                app_version: self.connection_params.app_version.clone(),
-                system_lang_code: self.connection_params.system_lang_code.clone(),
-                lang_pack: "".into(),
-                lang_code: self.connection_params.lang_code.clone(),
-                proxy: None,
-                params: None,
-                query: tl::functions::help::GetConfig {},
-            },
-        };
-
-        let mut sender = if let Some(auth_key) = dc_option.auth_key {
-            connect_with_auth(transport(), addr(), auth_key)
-                .await
-                .map_err(InvocationError::Io)?
-        } else {
-            connect(transport(), addr()).await?
-        };
-
-        let enums::Config::Config(remote_config) = match sender.invoke(&init_connection).await {
-            Ok(config) => config,
-            Err(InvocationError::Transport(transport::Error::BadStatus { status: 404 })) => {
-                sender = connect(transport(), addr()).await?;
-                sender.invoke(&init_connection).await?
-            }
-            Err(e) => return Err(e),
-        };
-
-        self.update_config(remote_config).await?;
-
-        Ok(sender)
-    }
-
-    async fn update_config(
-        &self,
-        config: tl::types::Config,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        for option in config
-            .dc_options
-            .iter()
-            .map(|tl::enums::DcOption::Option(option)| option)
-            .filter(|option| !option.media_only && !option.tcpo_only && option.r#static)
-        {
-            let mut dc_option = self
-                .session
-                .dc_option(option.id)?
-                .unwrap_or_else(|| DcOption {
-                    id: option.id,
-                    ipv4: SocketAddrV4::new(Ipv4Addr::from_bits(0), 0),
-                    ipv6: SocketAddrV6::new(Ipv6Addr::from_bits(0), 0, 0, 0),
-                    auth_key: None,
-                });
-            // An unparsable address from the server skips that option, not the whole config.
-            if !merge_dc_option(&mut dc_option, option) {
-                continue;
-            }
-            self.session.set_dc_option(&dc_option).await?;
-        }
-        Ok(())
-    }
 }
 
 /// `406 AUTH_KEY_DUPLICATED`: the session was already invalidated by the server, a new auth key
@@ -574,74 +379,4 @@ impl fmt::Debug for Request {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::RpcError;
-
-    fn rpc(code: i32, name: &str) -> InvocationError {
-        InvocationError::Rpc(RpcError {
-            code,
-            name: name.into(),
-            value: None,
-            caused_by: None,
-        })
-    }
-
-    #[test]
-    fn only_a_406_auth_key_duplicated_invalidates_the_key() {
-        assert!(is_auth_key_duplicated(&rpc(406, "AUTH_KEY_DUPLICATED")));
-        assert!(!is_auth_key_duplicated(&rpc(406, "OTHER")));
-        assert!(!is_auth_key_duplicated(&rpc(401, "AUTH_KEY_DUPLICATED")));
-        assert!(!is_auth_key_duplicated(&InvocationError::InvalidDc));
-    }
-
-    #[tokio::test]
-    async fn the_runner_forgets_the_key_of_a_duplicated_session() {
-        let mut session = mtg_session::SessionData::default();
-        let mut dc = empty();
-        dc.auth_key = Some([7; 256]);
-        session.dc_options.insert(2, dc);
-        let session = Arc::new(mtg_session::storages::MemorySession::from(session));
-        let pool = SenderPool::new(Arc::clone(&session), 1);
-        let mut runner = pool.runner;
-
-        let (tx, rx) = oneshot::channel();
-        let flow = runner
-            .process_request(Request::CheckRetry {
-                dc_id: 2,
-                error: rpc(406, "AUTH_KEY_DUPLICATED"),
-                fail_count: NonZeroU32::MIN,
-                slept_so_far: Duration::ZERO,
-                tx,
-            })
-            .await;
-        assert!(flow.is_continue());
-        assert!(matches!(rx.await, Ok(ControlFlow::Break(_))));
-        assert_eq!(session.dc_option(2).unwrap().unwrap().auth_key, None);
-
-        // another error leaves the key alone
-        let mut dc = empty();
-        dc.auth_key = Some([7; 256]);
-        session.set_dc_option(&dc).await.unwrap();
-        let (tx, _rx) = oneshot::channel();
-        let _ = runner
-            .process_request(Request::CheckRetry {
-                dc_id: 2,
-                error: rpc(420, "FLOOD_WAIT"),
-                fail_count: NonZeroU32::MIN,
-                slept_so_far: Duration::ZERO,
-                tx,
-            })
-            .await;
-        assert!(session.dc_option(2).unwrap().unwrap().auth_key.is_some());
-    }
-
-    fn empty() -> DcOption {
-        DcOption {
-            id: 2,
-            ipv4: SocketAddrV4::new(Ipv4Addr::from_bits(0), 0),
-            ipv6: SocketAddrV6::new(Ipv6Addr::from_bits(0), 0, 0, 0),
-            auth_key: None,
-        }
-    }
-}
+mod tests;
