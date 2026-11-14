@@ -1,5 +1,10 @@
 # Dependencies
 
+## mtg-crypto
+
+Decrypts the fallback `help.configSimple` block (RSA public operation, AES, SHA-256 check)
+in `fallback.rs`.
+
 ## mtg-mtproto
 
 Contains the actual implementation of the protocol without performing any IO. This crate's job

@@ -16,6 +16,7 @@ proxy = ["tokio-socks", "hickory-resolver", "url"]
 
 [dependencies]
 bytes = "1.12.1"
+mtg-crypto = { path = "../mtg-crypto", version = "0.12.0" }
 mtg-mtproto = { path = "../mtg-mtproto", version = "0.12.0" }
 mtg-session = { path = "../mtg-session", version = "0.12.0", default-features = false }
 mtg-tl-types = { path = "../mtg-tl-types", version = "0.12.0", features = [ "tl-mtproto", "deserializable-functions" ] }
