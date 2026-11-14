@@ -193,3 +193,45 @@ async fn connector_reports_the_last_error_when_every_address_is_dead() {
     assert!(matches!(err, InvocationError::Io(_)), "{err:?}");
     pool.handle.quit();
 }
+
+async fn through_proxy(secret_text: &str, padded: bool) {
+    let secret: [u8; 16] = std::array::from_fn(|i| i as u8 * 3 + 1);
+    let server = FakeServer::start_proxy(secret).await;
+    mock_app_config(&server);
+    let hex: String = secret.iter().map(|b| format!("{b:02x}")).collect();
+    let link = format!(
+        "tg://proxy?server=127.0.0.1&port={}&secret={secret_text}{hex}",
+        server.addr.port()
+    );
+    let proxy = mtg_mtsender::MtProxy::from_link(&link).unwrap();
+    assert_eq!(proxy.padded, padded);
+    let session = server.session();
+    // the datacenter address is dead: only the proxy can answer
+    use mtg_session::Session;
+    let mut dc = session.dc_option(2).unwrap().unwrap();
+    dc.ipv4 = "127.0.0.1:1".parse().unwrap();
+    session.set_dc_option(&dc).await.unwrap();
+    let params = mtg_mtsender::ConnectionParams {
+        mtproxy: Some(proxy),
+        ..Default::default()
+    };
+    let pool = SenderPool::with_configuration(session, 1, params);
+    tokio::spawn(pool.runner.run());
+    let handle = pool.handle;
+    // several round trips: the stream cipher and (for dd) the padding must stay in step
+    for _ in 0..3 {
+        call(&handle).await.unwrap();
+    }
+    assert_eq!(server.proxy_dcs(), vec![2]);
+    handle.quit();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mtproxy_plain_secret_end_to_end() {
+    through_proxy("", false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mtproxy_padded_secret_end_to_end() {
+    through_proxy("dd", true).await;
+}

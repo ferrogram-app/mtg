@@ -9,9 +9,9 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
-use mtg_crypto::AuthKey;
+use mtg_crypto::{AuthKey, ObfuscatedCipher};
 use mtg_mtproto::DequeBuffer;
-use mtg_mtproto::transport::{Full, Transport};
+use mtg_mtproto::transport::{Full, Intermediate, Tagged, Transport};
 use mtg_tl_types as tl;
 use mtg_tl_types::{Deserializable, Identifiable, RemoteCall, Serializable};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -57,6 +57,9 @@ pub struct FakeServer {
     // separate lock: handlers run while `state` is held
     seen: Arc<Mutex<Vec<&'static str>>>,
     connections: Arc<std::sync::atomic::AtomicUsize>,
+    /// `Some(secret)`: behave as an MTProxy (obfuscated2 with this secret) in front of the server.
+    proxy: Option<[u8; 16]>,
+    proxy_dcs: Arc<Mutex<Vec<i16>>>,
 }
 
 impl FakeServer {
@@ -83,14 +86,32 @@ impl FakeServer {
         std::sync::Arc::new(data.into())
     }
 
+    /// Datacenter ids that clients asked the proxy for (see [`FakeServer::start_proxy`]).
+    pub fn proxy_dcs(&self) -> Vec<i16> {
+        self.proxy_dcs.lock().unwrap().clone()
+    }
+
+    /// Like [`FakeServer::start`], but the server is an MTProxy: clients must open an obfuscated2
+    /// connection with this 16-byte `secret` (plain or `dd`), after which the usual MTProto
+    /// follows over the intermediate transport. The datacenter id they ask for is recorded.
+    pub async fn start_proxy(secret: [u8; 16]) -> FakeServer {
+        Self::start_with(Some(secret)).await
+    }
+
     /// Starts listening on a free local port.
     pub async fn start() -> FakeServer {
+        Self::start_with(None).await
+    }
+
+    async fn start_with(proxy: Option<[u8; 16]>) -> FakeServer {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let server = FakeServer {
             addr: listener.local_addr().unwrap(),
             state: Default::default(),
             seen: Default::default(),
             connections: Default::default(),
+            proxy,
+            proxy_dcs: Default::default(),
         };
         server.on(|_: tl::functions::help::GetConfig| Ok(config()));
         let s = server.clone();
@@ -143,7 +164,34 @@ impl FakeServer {
 
     async fn serve(self, mut sock: tokio::net::TcpStream) {
         let key = AuthKey::from_bytes(KEY);
-        let mut transport = Full::new();
+        let mut transport: Box<dyn Transport + Send> = Box::new(Full::new());
+        let mut cipher: Option<ObfuscatedCipher> = None;
+        // a padded (`dd`) client appends up to 15 bytes to every packet
+        let mut padded = false;
+        if let Some(secret) = self.proxy {
+            let mut head = [0u8; 64];
+            if sock.read_exact(&mut head).await.is_err() {
+                return;
+            }
+            let rev: [u8; 64] = std::array::from_fn(|i| head[63 - i]);
+            let mut c = ObfuscatedCipher::with_secret(&rev, &secret);
+            c.decrypt(&mut head);
+            padded = head[56..60] == [0xdd; 4];
+            assert!(
+                padded || head[56..60] == [0xee; 4],
+                "unsupported tag {:x?}",
+                &head[56..60]
+            );
+            self.proxy_dcs
+                .lock()
+                .unwrap()
+                .push(i16::from_le_bytes([head[60], head[61]]));
+            let mut inter = Intermediate::new();
+            // the tag came in the head: nothing more to send
+            inter.init_tag();
+            transport = Box::new(inter);
+            cipher = Some(c);
+        }
         let mut inbuf = Vec::new();
         let mut chunk = [0u8; 4096];
         let mut msg_counter = 0u64;
@@ -152,10 +200,17 @@ impl FakeServer {
                 Ok(0) | Err(_) => return,
                 Ok(n) => n,
             };
+            if let Some(c) = cipher.as_mut() {
+                c.decrypt(&mut chunk[..n]);
+            }
             inbuf.extend_from_slice(&chunk[..n]);
             while let Ok(off) = transport.unpack(&mut inbuf) {
                 let mut frame = inbuf[off.data_range.clone()].to_vec();
                 inbuf.drain(..off.next_offset);
+                if padded && frame.len() > 24 {
+                    // drop the random tail: the encrypted part is a multiple of 16 bytes
+                    frame.truncate(24 + (frame.len() - 24) / 16 * 16);
+                }
                 let Some((session, msg_id, body)) = decrypt(&key, &mut frame) else {
                     return;
                 };
@@ -166,7 +221,7 @@ impl FakeServer {
                             let mut buf = DequeBuffer::with_capacity(junk.len(), 32);
                             buf.extend_back(&junk);
                             transport.pack(&mut buf);
-                            if sock.write_all(buf.as_ref()).await.is_err() {
+                            if write(&mut sock, &mut cipher, buf.as_mut()).await.is_err() {
                                 return;
                             }
                             continue;
@@ -184,7 +239,7 @@ impl FakeServer {
                     let mut buf = DequeBuffer::with_capacity(wire.len(), 32);
                     buf.extend_back(&wire);
                     transport.pack(&mut buf);
-                    if sock.write_all(buf.as_ref()).await.is_err() {
+                    if write(&mut sock, &mut cipher, buf.as_mut()).await.is_err() {
                         return;
                     }
                 }
@@ -307,6 +362,17 @@ impl FakeServer {
         }
         out
     }
+}
+
+async fn write(
+    sock: &mut tokio::net::TcpStream,
+    cipher: &mut Option<ObfuscatedCipher>,
+    bytes: &mut [u8],
+) -> std::io::Result<()> {
+    if let Some(c) = cipher {
+        c.encrypt(bytes);
+    }
+    sock.write_all(bytes).await
 }
 
 /// Client-to-server direction (x = 0): `decrypt_data_v2` derives for server-to-client (x = 8), so it is given
