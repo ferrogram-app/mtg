@@ -22,7 +22,7 @@ use std::{fmt, ops::Range};
 
 pub use abridged::Abridged;
 pub use full::Full;
-pub use intermediate::Intermediate;
+pub use intermediate::{Intermediate, PaddedIntermediate};
 pub use obfuscated::Obfuscated;
 
 use crate::DequeBuffer;

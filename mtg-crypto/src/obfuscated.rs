@@ -18,12 +18,16 @@ pub struct ObfuscatedCipher {
     tx: ctr::Ctr128BE<aes::Aes256>,
 }
 
-/// Key (bytes 8..40) and IV (bytes 40..56) of the 64-byte init payload.
-fn key_iv(init: &[u8; 64]) -> ([u8; 32], [u8; 16]) {
-    (
-        std::array::from_fn(|i| init[8 + i]),
-        std::array::from_fn(|i| init[40 + i]),
-    )
+/// Key (bytes 8..40) and IV (bytes 40..56) of the 64-byte init payload; with a proxy `secret`
+/// the key is `SHA256(key || secret)`.
+fn key_iv(init: &[u8; 64], secret: &[u8]) -> ([u8; 32], [u8; 16]) {
+    let key: [u8; 32] = std::array::from_fn(|i| init[8 + i]);
+    let key = if secret.is_empty() {
+        key
+    } else {
+        crate::sha256!(&key, secret)
+    };
+    (key, std::array::from_fn(|i| init[40 + i]))
 }
 
 impl ObfuscatedCipher {
@@ -31,9 +35,17 @@ impl ObfuscatedCipher {
     /// the receiving side its byte-reversed copy.
     #[must_use]
     pub fn new(init: &[u8; 64]) -> Self {
+        Self::with_secret(init, &[])
+    }
+
+    /// Like [`Self::new`] for a connection through an
+    /// [MTProxy](https://core.telegram.org/mtproto/mtproto-transports#transport-obfuscation):
+    /// both keys are mixed with the proxy's 16-byte `secret` (empty means no secret).
+    #[must_use]
+    pub fn with_secret(init: &[u8; 64], secret: &[u8]) -> Self {
         let init_rev: [u8; 64] = std::array::from_fn(|i| init[63 - i]);
-        let (rx_key, rx_iv) = key_iv(&init_rev);
-        let (tx_key, tx_iv) = key_iv(init);
+        let (rx_key, rx_iv) = key_iv(&init_rev, secret);
+        let (tx_key, tx_iv) = key_iv(init, secret);
         #[allow(deprecated)] // see https://github.com/RustCrypto/block-ciphers/issues/509
         Self {
             rx: ctr::Ctr128BE::<aes::Aes256>::new(&rx_key.into(), &rx_iv.into()),
@@ -97,5 +109,35 @@ mod tests {
         let mut got = vec![0u8; 33];
         ObfuscatedCipher::new(&init).encrypt(&mut got);
         assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn the_secret_changes_the_keys_and_both_sides_agree() {
+        let init = init();
+        let reversed: [u8; 64] = std::array::from_fn(|i| init[63 - i]);
+        let secret = [7u8; 16];
+        let mut ours = ObfuscatedCipher::with_secret(&init, &secret);
+        let mut theirs = ObfuscatedCipher::with_secret(&reversed, &secret);
+        let mut plain = ObfuscatedCipher::new(&init);
+
+        let mut a = b"hello".to_vec();
+        let mut b = a.clone();
+        ours.encrypt(&mut a);
+        plain.encrypt(&mut b);
+        assert_ne!(a, b);
+        theirs.decrypt(&mut a);
+        assert_eq!(a, b"hello");
+    }
+
+    #[test]
+    fn secret_key_is_sha256_of_key_and_secret() {
+        // keystream computed independently: AES-256-CTR(SHA256(init[8..40] || secret), init[40..56])
+        let mut c = ObfuscatedCipher::with_secret(&init(), &[7u8; 16]);
+        let mut zeros = [0u8; 32];
+        c.encrypt(&mut zeros);
+        assert_eq!(
+            crate::hex::to_hex(&zeros),
+            "63cc540027b09de5487db0b5d2eb0a63230aa23adb167b75b810952c87544eef"
+        );
     }
 }

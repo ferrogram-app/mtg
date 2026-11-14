@@ -94,6 +94,55 @@ impl Tagged for Intermediate {
     }
 }
 
+/// The [padded intermediate transport]: like [`Intermediate`], but every packet carries 0 to 15
+/// random bytes after the payload, which hides the real length. Used by MTProxy (`dd` secrets).
+///
+/// Telegram's servers never pad what they send, so reading works as in [`Intermediate`].
+///
+/// [padded intermediate transport]: https://core.telegram.org/mtproto/mtproto-transports#padded-intermediate
+pub struct PaddedIntermediate {
+    inner: Intermediate,
+}
+
+#[allow(clippy::new_without_default)]
+impl PaddedIntermediate {
+    const TAG: [u8; 4] = 0xdd_dd_dd_dd_u32.to_le_bytes();
+
+    /// Creates the transport.
+    pub fn new() -> Self {
+        Self {
+            inner: Intermediate::new(),
+        }
+    }
+}
+
+impl Transport for PaddedIntermediate {
+    fn pack(&mut self, buffer: &mut DequeBuffer<u8>) {
+        let mut pad = [0u8; 16];
+        // no OS randomness: padding is not a secret, but the length must not be predictable
+        getrandom::fill(&mut pad).unwrap();
+        let pad_len = usize::from(pad[0] & 0x0f);
+        buffer.extend_back(&pad[1..1 + pad_len.min(15)]);
+        let len = buffer.len();
+        buffer.extend_front(&(len as i32).to_le_bytes());
+        if !self.inner.init {
+            buffer.extend_front(&Self::TAG);
+            self.inner.init = true;
+        }
+    }
+
+    fn unpack(&mut self, buffer: &mut [u8]) -> Result<UnpackedOffset, Error> {
+        self.inner.unpack(buffer)
+    }
+}
+
+impl Tagged for PaddedIntermediate {
+    fn init_tag(&mut self) -> [u8; 4] {
+        self.inner.init = true;
+        Self::TAG
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -182,5 +231,37 @@ mod tests {
             transport.unpack(&mut buffer[..]),
             Err(Error::BadStatus { status: 404 })
         );
+    }
+
+    #[test]
+    fn padded_packets_carry_up_to_15_random_bytes_counted_in_the_length() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..200 {
+            let mut transport = PaddedIntermediate::new();
+            let mut buffer = DequeBuffer::with_capacity(8, 0);
+            buffer.extend_back(&[1, 2, 3, 4, 5, 6, 7, 8]);
+            transport.pack(&mut buffer);
+            assert_eq!(&buffer[..4], &[0xdd; 4]);
+            let len = i32::from_le_bytes(buffer[4..8].try_into().unwrap()) as usize;
+            assert_eq!(buffer.len(), 8 + len);
+            assert!((8..=23).contains(&len), "{len}");
+            assert_eq!(&buffer[8..16], &[1, 2, 3, 4, 5, 6, 7, 8]);
+            seen.insert(len);
+            // the tag is sent once
+            let mut again = DequeBuffer::with_capacity(4, 0);
+            again.extend_back(&[0; 4]);
+            transport.pack(&mut again);
+            assert_ne!(&again[..4], &[0xdd; 4]);
+        }
+        assert!(seen.len() > 1, "padding length never varies");
+    }
+
+    #[test]
+    fn padded_reads_like_intermediate_and_tags_for_obfuscation() {
+        let mut transport = PaddedIntermediate::new();
+        assert_eq!(transport.init_tag(), [0xdd; 4]);
+        let mut buffer = vec![8, 0, 0, 0, 9, 9, 9, 9, 9, 9, 9, 9];
+        let offset = transport.unpack(&mut buffer).unwrap();
+        assert_eq!(&buffer[offset.data_range], &[9; 8]);
     }
 }

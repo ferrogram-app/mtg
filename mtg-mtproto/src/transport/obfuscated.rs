@@ -43,7 +43,7 @@ const FORBIDDEN_FIRST_INTS: [[u8; 4]; 7] = [
 ];
 
 impl<T: Transport + Tagged> Obfuscated<T> {
-    fn generate_keys(inner: &mut T) -> ([u8; 64], ObfuscatedCipher) {
+    fn generate_keys(inner: &mut T, proxy: Option<(&[u8], i16)>) -> ([u8; 64], ObfuscatedCipher) {
         let mut init = [0; 64];
 
         while init[4..8] == [0; 4] // Full
@@ -55,8 +55,12 @@ impl<T: Transport + Tagged> Obfuscated<T> {
         }
 
         init[56..60].copy_from_slice(&inner.init_tag());
+        if let Some((_, dc_id)) = proxy {
+            // tells the proxy which datacenter to forward to
+            init[60..62].copy_from_slice(&dc_id.to_le_bytes());
+        }
 
-        let mut cipher = ObfuscatedCipher::new(&init);
+        let mut cipher = ObfuscatedCipher::with_secret(&init, proxy.map_or(&[], |(s, _)| s));
 
         let mut encrypted_init = init.to_vec();
         cipher.encrypt(&mut encrypted_init);
@@ -66,8 +70,21 @@ impl<T: Transport + Tagged> Obfuscated<T> {
     }
 
     /// Creates the transport.
-    pub fn new(mut inner: T) -> Self {
-        let (init, cipher) = Self::generate_keys(&mut inner);
+    pub fn new(inner: T) -> Self {
+        Self::build(inner, None)
+    }
+
+    /// Creates the transport for a connection through an MTProxy.
+    ///
+    /// `secret` is the 16 secret bytes (without the `dd`/`ee` prefix and without a fake-TLS
+    /// domain); `dc_id` is the datacenter the proxy must forward to: negative for the media
+    /// connection of that datacenter, `10000 +` the id for test datacenters.
+    pub fn with_proxy(inner: T, secret: &[u8; 16], dc_id: i16) -> Self {
+        Self::build(inner, Some((secret, dc_id)))
+    }
+
+    fn build(mut inner: T, proxy: Option<(&[u8], i16)>) -> Self {
+        let (init, cipher) = Self::generate_keys(&mut inner, proxy);
 
         Self {
             inner,
@@ -164,5 +181,25 @@ mod tests {
         let (mut client, _, _) = pair();
         client.decrypt_tail = 10;
         assert_eq!(client.unpack(&mut [0u8; 4]), Err(Error::MissingBytes));
+    }
+
+    #[test]
+    fn a_proxy_head_carries_the_dc_and_keys_mixed_with_the_secret() {
+        let secret = [9u8; 16];
+        let mut client =
+            Obfuscated::with_proxy(super::super::PaddedIntermediate::new(), &secret, -4);
+        let mut buffer = DequeBuffer::with_capacity(4, 0);
+        buffer.extend_back(&[1, 2, 3, 4]);
+        client.pack(&mut buffer);
+        let head: [u8; 64] = buffer[..64].try_into().unwrap();
+
+        // what the proxy does: derive the server side from the head and the secret
+        let rev: [u8; 64] = std::array::from_fn(|i| head[63 - i]);
+        let mut server = ObfuscatedCipher::with_secret(&rev, &secret);
+        let mut all = buffer[..].to_vec();
+        server.decrypt(&mut all);
+        // the client's keystream also covered the first 56 bytes, which the proxy knows are random
+        assert_eq!(&all[56..60], &[0xdd; 4], "padded intermediate tag");
+        assert_eq!(i16::from_le_bytes([all[60], all[61]]), -4, "datacenter");
     }
 }
