@@ -285,11 +285,10 @@ impl Session for SqliteSession {
             }
 
             let db = self.database.lock().await;
-            let tx = db.0.transaction().await.unwrap();
+            let tx = db.0.transaction().await?;
             let stmt = tx
                 .prepare("INSERT OR REPLACE INTO peer_info VALUES (:peer_id, :hash, :subtype)")
-                .await
-                .unwrap();
+                .await?;
             for peer in extended_peers {
                 let subtype = match peer {
                     PeerInfo::User { bot, is_self, .. } => {

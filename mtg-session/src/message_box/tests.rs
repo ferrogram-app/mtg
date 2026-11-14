@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use mtg_tl_types as tl;
 
+use super::defs::PtsInfo;
 use super::defs::{
     Gap, MessageBox, MessageBoxes, NO_DATE, NO_PTS, NO_SEQ, NO_UPDATES_TIMEOUT, State,
     UpdateAndPeers,
@@ -767,4 +768,54 @@ fn a_state_with_qts_but_no_pts_does_not_panic_when_asking_for_the_difference() {
 
     // there is no pts to ask with: nothing to request until the state is fetched
     assert_eq!(message_boxes.get_difference(), None);
+}
+
+#[test]
+fn a_channel_peer_in_a_common_box_update_is_not_a_panic() {
+    // `updateReadHistoryInbox` & co only carry users and chats; a channel there is bogus input.
+    let peer: tl::enums::Peer = tl::types::PeerChannel { channel_id: 1 }.into();
+    let updates = [
+        tl::enums::Update::ReadHistoryInbox(tl::types::UpdateReadHistoryInbox {
+            folder_id: None,
+            peer: peer.clone(),
+            top_msg_id: None,
+            max_id: 1,
+            still_unread_count: 0,
+            pts: 5,
+            pts_count: 1,
+        }),
+        tl::enums::Update::ReadHistoryOutbox(tl::types::UpdateReadHistoryOutbox {
+            peer: peer.clone(),
+            max_id: 1,
+            pts: 5,
+            pts_count: 1,
+        }),
+        tl::enums::Update::PinnedMessages(tl::types::UpdatePinnedMessages {
+            pinned: true,
+            peer,
+            messages: vec![1],
+            pts: 5,
+            pts_count: 1,
+        }),
+    ];
+    for update in &updates {
+        // no pts info: the update is delivered without being sequenced
+        assert!(PtsInfo::from_update(update).is_none(), "{update:?}");
+    }
+}
+
+#[test]
+fn channel_difference_calls_out_of_order_are_ignored_not_fatal() {
+    let mut message_boxes = MessageBoxes::new();
+    assert!(message_boxes.get_channel_difference().is_none());
+    message_boxes.end_channel_difference(PrematureEndReason::Banned);
+    let (updates, users, chats) = message_boxes.apply_channel_difference(
+        tl::types::updates::ChannelDifferenceEmpty {
+            r#final: true,
+            pts: 1,
+            timeout: None,
+        }
+        .into(),
+    );
+    assert!(updates.is_empty() && users.is_empty() && chats.is_empty());
 }

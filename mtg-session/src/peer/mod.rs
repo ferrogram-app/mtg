@@ -9,6 +9,8 @@
 use std::ops::RangeInclusive;
 
 mod convert;
+#[cfg(test)]
+mod tests;
 
 /// A compact peer identifier.
 /// ```
@@ -229,8 +231,13 @@ impl PeerId {
             || (-4000000000000 <= self.0 && self.0 <= -2002147483649)
         {
             PeerKind::Channel
+        } else if self.0 > 0 {
+            // outside the documented ranges (made-up ids, the `EMPTY_CHAT_ID` hole): sort by sign
+            PeerKind::User
+        } else if self.0 > EMPTY_CHAT_ID {
+            PeerKind::Chat
         } else {
-            unreachable!()
+            PeerKind::Channel
         }
     }
 

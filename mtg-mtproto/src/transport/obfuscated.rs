@@ -89,8 +89,9 @@ impl<T: Transport + Tagged> Transport for Obfuscated<T> {
 
     fn unpack(&mut self, buffer: &mut [u8]) -> Result<UnpackedOffset, Error> {
         if buffer.len() < self.decrypt_tail {
-            // contract: the caller keeps the bytes already decrypted until they are consumed
-            panic!("buffer is smaller than what was decrypted");
+            // contract: the caller keeps the bytes already decrypted until they are consumed;
+            // if it does not, the stream is out of step, so report it instead of panicking
+            return Err(Error::MissingBytes);
         }
 
         self.cipher.decrypt(&mut buffer[self.decrypt_tail..]);
@@ -159,10 +160,9 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "smaller than what was decrypted")]
-    fn unpack_panics_if_the_caller_shrinks_the_buffer() {
+    fn unpack_reports_missing_bytes_if_the_caller_shrinks_the_buffer() {
         let (mut client, _, _) = pair();
         client.decrypt_tail = 10;
-        let _ = client.unpack(&mut [0u8; 4]);
+        assert_eq!(client.unpack(&mut [0u8; 4]), Err(Error::MissingBytes));
     }
 }

@@ -9,7 +9,7 @@
 //! Getting and applying the account and channel differences.
 
 use mtg_tl_types as tl;
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 use super::adaptor;
 use super::defs::{
@@ -158,9 +158,8 @@ impl MessageBoxes {
 
         // It is possible that the result from `GetDifference` includes users with `min = true`.
         // TODO in that case, we will have to resort to getUsers.
-        let (mut result_updates, users, chats) = self
-            .process_updates(us)
-            .expect("gap is detected while applying difference");
+        // `seq` is `NO_SEQ` and the update kinds are fixed, so `adapt` cannot report a gap here
+        let (mut result_updates, users, chats) = self.process_updates(us).unwrap_or_default();
 
         result_updates.extend(
             new_messages
@@ -224,7 +223,8 @@ impl MessageBoxes {
             trace!(?gd, "requesting");
             Some(gd)
         } else {
-            panic!("Should not try to get difference for an entry {key:?} without known state");
+            warn!(?key, "no known state to get the difference from");
+            None
         }
     }
 
@@ -233,9 +233,11 @@ impl MessageBoxes {
         &mut self,
         difference: tl::enums::updates::ChannelDifference,
     ) -> UpdateAndPeers {
-        let (key, channel_id) = self
-            .channel_in_diff()
-            .expect("applying channel difference to have a channel in getting_diff_for");
+        let Some((key, channel_id)) = self.channel_in_diff() else {
+            // the caller got out of step with `get_channel_difference`; nothing to apply to
+            warn!("applying a channel difference while no channel is getting one");
+            return Default::default();
+        };
 
         trace!(channel_id, ?difference, "applying channel difference");
 
@@ -274,9 +276,7 @@ impl MessageBoxes {
             date: NO_DATE,
             seq: NO_SEQ,
         }));
-        let (mut result_updates, users, chats) = self
-            .process_updates(us)
-            .expect("gap is detected while applying channel difference");
+        let (mut result_updates, users, chats) = self.process_updates(us).unwrap_or_default();
 
         result_updates.extend(new_messages.into_iter().map(|message| {
             (
@@ -300,9 +300,13 @@ impl MessageBoxes {
     }
 
     pub fn end_channel_difference(&mut self, reason: PrematureEndReason) {
-        let (key, channel_id) = self
-            .channel_in_diff()
-            .expect("ending channel difference to have a channel in getting_diff_for");
+        let Some((key, channel_id)) = self.channel_in_diff() else {
+            warn!(
+                ?reason,
+                "ending a channel difference while no channel is getting one"
+            );
+            return;
+        };
 
         trace!(channel_id, ?reason, "ending channel difference");
         match reason {

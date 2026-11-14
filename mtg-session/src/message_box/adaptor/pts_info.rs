@@ -5,10 +5,11 @@ impl PtsInfo {
         use tl::enums::Update::*;
         match update {
             NewMessage(u) => {
-                assert!(!matches!(
-                    message_peer(&u.message),
-                    Some(tl::enums::Peer::Channel(_))
-                ));
+                // channels are sequenced by their own `pts`; a channel here is bogus input, so the update
+                // is not sequenced instead of trusting it (and panicking)
+                if matches!(message_peer(&u.message), Some(tl::enums::Peer::Channel(_))) {
+                    return None;
+                }
                 Some(Self {
                     key: Key::Common,
                     pts: u.pts,
@@ -43,7 +44,11 @@ impl PtsInfo {
             Privacy(_) => None,
             UserPhone(_) => None,
             ReadHistoryInbox(u) => {
-                assert!(!matches!(u.peer, tl::enums::Peer::Channel(_)));
+                // channels are sequenced by their own `pts`; a channel here is bogus input, so the update
+                // is not sequenced instead of trusting it (and panicking)
+                if matches!(u.peer, tl::enums::Peer::Channel(_)) {
+                    return None;
+                }
                 Some(Self {
                     key: Key::Common,
                     pts: u.pts,
@@ -51,7 +56,11 @@ impl PtsInfo {
                 })
             }
             ReadHistoryOutbox(u) => {
-                assert!(!matches!(u.peer, tl::enums::Peer::Channel(_)));
+                // channels are sequenced by their own `pts`; a channel here is bogus input, so the update
+                // is not sequenced instead of trusting it (and panicking)
+                if matches!(u.peer, tl::enums::Peer::Channel(_)) {
+                    return None;
+                }
                 Some(Self {
                     key: Key::Common,
                     pts: u.pts,
@@ -109,10 +118,11 @@ impl PtsInfo {
             }),
             BotCallbackQuery(_) => None,
             EditMessage(u) => {
-                assert!(!matches!(
-                    message_peer(&u.message),
-                    Some(tl::enums::Peer::Channel(_))
-                ));
+                // channels are sequenced by their own `pts`; a channel here is bogus input, so the update
+                // is not sequenced instead of trusting it (and panicking)
+                if matches!(message_peer(&u.message), Some(tl::enums::Peer::Channel(_))) {
+                    return None;
+                }
                 Some(Self {
                     key: Key::Common,
                     pts: u.pts,
@@ -170,7 +180,11 @@ impl PtsInfo {
             PeerBlocked(_) => None,
             ChannelUserTyping(_) => None,
             PinnedMessages(u) => {
-                assert!(!matches!(u.peer, tl::enums::Peer::Channel(_)));
+                // channels are sequenced by their own `pts`; a channel here is bogus input, so the update
+                // is not sequenced instead of trusting it (and panicking)
+                if matches!(u.peer, tl::enums::Peer::Channel(_)) {
+                    return None;
+                }
                 Some(Self {
                     key: Key::Common,
                     pts: u.pts,
