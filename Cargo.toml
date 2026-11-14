@@ -8,6 +8,7 @@ members = [
     "mtg-tl-gen",
     "mtg-tl-parser",
     "mtg-tl-types",
+    "mtg-testkit",
 ]
 resolver = "2"
 

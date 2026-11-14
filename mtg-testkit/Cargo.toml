@@ -1,0 +1,19 @@
+[package]
+name = "mtg-testkit"
+version = "0.12.0"
+license = "MIT OR Apache-2.0"
+description = "A fake MTProto server for tests of the mtg crates."
+repository = "https://github.com/ferrogram-app/mtg"
+edition = "2024"
+publish = false
+
+[dependencies]
+mtg-crypto = { path = "../mtg-crypto", version = "0.12.0" }
+mtg-mtproto = { path = "../mtg-mtproto", version = "0.12.0" }
+mtg-session = { path = "../mtg-session", version = "0.12.0", default-features = false }
+mtg-tl-types = { path = "../mtg-tl-types", version = "0.12.0", features = ["tl-mtproto", "deserializable-functions"] }
+tokio = { version = "1.54.1", default-features = false, features = ["io-util", "net", "rt", "macros"] }
+
+[dev-dependencies]
+mtg-mtsender = { path = "../mtg-mtsender", version = "0.12.0" }
+tokio = { version = "1.54.1", default-features = false, features = ["io-util", "net", "rt", "macros", "time", "rt-multi-thread"] }
