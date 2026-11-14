@@ -184,9 +184,10 @@ impl<T: Transport, M: mtp::Mtp> Sender<T, M> {
                         // a server that keeps rejecting the same request must not loop us forever
                         warn!(request = ?pair.msg_id, "{}; too many resends", bad_msg.description());
                         let req = self.requests.swap_remove(i);
-                        drop(req.result.send(Err(InvocationError::Dropped(
-                            "too many bad_msg resends",
-                        ))));
+                        drop(
+                            req.result
+                                .send(Err(InvocationError::Dropped("too many bad_msg resends"))),
+                        );
                     } else if bad_msg.retryable() {
                         info!(
                             request = ?pair.msg_id,

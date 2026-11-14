@@ -118,6 +118,7 @@ impl SenderPoolRunner {
             rpc_rx,
             self.updates_tx.clone(),
             dc_option.id == self.session.home_dc_id()?,
+            Arc::clone(&self.time_offset),
         ));
         self.connections.push(ConnectionInfo {
             dc_id,
@@ -291,7 +292,9 @@ impl SenderPoolRunner {
         };
 
         let mut sender = if let Some(auth_key) = auth_key {
-            connect_with_auth(transport(), addr(), auth_key)
+            let offset = self.time_offset.load(Ordering::Relaxed);
+            let mtp = mtp::Encrypted::build().time_offset(offset).finish(auth_key);
+            Sender::connect(transport(), mtp, addr())
                 .await
                 .map_err(InvocationError::Io)?
         } else {

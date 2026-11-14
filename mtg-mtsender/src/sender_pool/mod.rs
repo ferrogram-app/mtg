@@ -9,6 +9,7 @@
 use std::num::NonZeroU32;
 use std::ops::{ControlFlow, Deref};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::Duration;
 use std::{fmt, panic};
 
@@ -33,7 +34,7 @@ use run::run_sender;
 
 use crate::configuration::{ConnectionParams, RetryContext};
 use crate::errors::{InvocationError, ReadError};
-use crate::{Sender, ServerAddr, connect, connect_with_auth};
+use crate::{Sender, ServerAddr, connect};
 
 mod connection;
 
@@ -121,6 +122,7 @@ pub struct SenderPoolRunner {
     request_rx: mpsc::UnboundedReceiver<Request>,
     updates_tx: mpsc::Sender<UpdatesLike>,
     connections: Vec<ConnectionInfo>,
+    time_offset: Arc<AtomicI32>,
     #[cfg(feature = "doh")]
     dns_fallback_tried: bool,
     connection_pool: JoinSet<Result<(), ReadError>>,
@@ -288,6 +290,7 @@ impl SenderPool {
                 request_rx,
                 updates_tx,
                 connections: Vec::new(),
+                time_offset: Arc::new(AtomicI32::new(0)),
                 #[cfg(feature = "doh")]
                 dns_fallback_tried: false,
                 connection_pool: JoinSet::new(),

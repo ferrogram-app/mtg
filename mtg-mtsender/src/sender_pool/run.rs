@@ -6,6 +6,8 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
 use mtg_mtproto::transport;
@@ -25,7 +27,11 @@ pub(super) async fn run_sender(
     mut rpc_rx: mpsc::UnboundedReceiver<Rpc>,
     updates: mpsc::Sender<UpdatesLike>,
     home_sender: bool,
+    time_offset: Arc<AtomicI32>,
 ) -> Result<(), ReadError> {
+    // one clock offset for the whole pool, so a reconnect does not start with a wrong clock
+    let mut last_offset = sender.time_offset();
+    time_offset.store(last_offset, Ordering::Relaxed);
     let mut dropped: usize = 0;
     let mut last_update_limit_warn = Instant::now();
     let mut updates_closed = false;
@@ -34,6 +40,10 @@ pub(super) async fn run_sender(
         tokio::select! {
             step = sender.step() => match step {
                 Ok(all_new_updates) => {
+                    if sender.time_offset() != last_offset {
+                        last_offset = sender.time_offset();
+                        time_offset.store(last_offset, Ordering::Relaxed);
+                    }
                     if updates_closed {
                         continue;
                     }

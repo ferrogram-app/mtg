@@ -903,3 +903,9 @@ fn an_incompressible_large_request_is_sent_unpacked_and_a_compressible_one_gzipp
     mtproto.finalize_plain(&mut buffer);
     assert_eq!(&buffer[MESSAGE_PREFIX_LEN + 16..][..4], GZIP_PACKED_HEADER);
 }
+
+#[test]
+fn the_current_time_offset_is_the_one_given_to_the_builder() {
+    let m = Encrypted::build().time_offset(-77).finish(auth_key());
+    assert_eq!(m.current_time_offset(), -77);
+}

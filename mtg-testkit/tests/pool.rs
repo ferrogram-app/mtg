@@ -97,6 +97,23 @@ async fn bad_msg_notification_about_the_clock_is_followed_by_a_resend() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_server_that_keeps_sending_bad_msg_gets_the_request_dropped() {
+    let server = FakeServer::start().await;
+    mock_app_config(&server);
+    let handle = pool(&server).await;
+    call(&handle).await.unwrap();
+    for _ in 0..20 {
+        server.inject(Fault::BadMsg { error_code: 16 });
+    }
+    let result = tokio::time::timeout(std::time::Duration::from_secs(10), call(&handle)).await;
+    assert!(
+        matches!(result, Ok(Err(InvocationError::Dropped(_)))),
+        "{result:?}"
+    );
+    handle.quit();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_closed_connection_is_reopened() {
     let server = FakeServer::start().await;
     mock_app_config(&server);
