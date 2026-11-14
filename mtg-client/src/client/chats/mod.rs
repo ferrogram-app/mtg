@@ -451,7 +451,7 @@ impl Client {
         let url_parse = url_parse_result.unwrap();
         let scheme = url_parse.scheme();
         let path = url_parse.path();
-        if url_parse.host_str().is_none() || !vec!["https", "http"].contains(&scheme) {
+        if url_parse.host_str().is_none() || !["https", "http"].contains(&scheme) {
             return None;
         }
         let host = url_parse.host_str().unwrap();
