@@ -102,12 +102,11 @@ impl ParticipantIter {
 
                 let chat = match full.full_chat {
                     tl::enums::ChatFull::Full(chat) => chat,
-                    tl::enums::ChatFull::ChannelFull(_) => panic!(
-                        "API returned ChannelFull even though messages::GetFullChat was used"
-                    ),
-                    tl::enums::ChatFull::CommunityFull(_) => panic!(
-                        "API returned CommunityFull even though messages::GetFullChat was used"
-                    ),
+                    tl::enums::ChatFull::ChannelFull(_) | tl::enums::ChatFull::CommunityFull(_) => {
+                        return Err(InvocationError::Dropped(
+                            "unexpected non-chat ChatFull from messages.getFullChat",
+                        ));
+                    }
                 };
 
                 // Don't actually care for the chats, just the users.
@@ -141,7 +140,9 @@ impl ParticipantIter {
                     match iter.client.invoke(&iter.request).await? {
                         Participants(p) => (p.count, p.participants, p.chats, p.users),
                         NotModified => {
-                            panic!("API returned Dialogs::NotModified even though hash = 0")
+                            return Err(InvocationError::Dropped(
+                                "unexpected ChannelParticipants::NotModified",
+                            ));
                         }
                     };
 

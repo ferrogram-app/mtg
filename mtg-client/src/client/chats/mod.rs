@@ -112,11 +112,12 @@ impl Client {
             })
             .await?;
 
-        if res.len() != 1 {
-            panic!("fetching only one user should exactly return one user");
+        match (res.pop(), res.is_empty()) {
+            (Some(user), true) => Ok(User::from_raw(self, user)),
+            _ => Err(InvocationError::Dropped(
+                "users.getUsers(self) did not return one user",
+            )),
         }
-
-        Ok(User::from_raw(self, res.pop().unwrap()))
     }
 
     /// Iterate over the participants of a chat.
@@ -325,9 +326,6 @@ impl Client {
                         id: vec![peer.into()],
                     })
                     .await?;
-                if res.len() > 1 {
-                    panic!("fetching only one user should exactly return one user");
-                }
                 self.build_peer_map(res, Vec::new()).await
             }
             PeerKind::Chat => {
@@ -340,9 +338,6 @@ impl Client {
                     tl::enums::messages::Chats::Chats(chats) => chats.chats,
                     tl::enums::messages::Chats::Slice(chat_slice) => chat_slice.chats,
                 };
-                if res.len() > 1 {
-                    panic!("fetching only one chat should exactly return one chat");
-                }
                 self.build_peer_map(Vec::new(), res).await
             }
             PeerKind::Channel => {
@@ -355,9 +350,6 @@ impl Client {
                     tl::enums::messages::Chats::Chats(chats) => chats.chats,
                     tl::enums::messages::Chats::Slice(chat_slice) => chat_slice.chats,
                 };
-                if res.len() > 1 {
-                    panic!("fetching only one channel should exactly return one chat");
-                }
                 self.build_peer_map(Vec::new(), res).await
             }
         };

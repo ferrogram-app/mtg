@@ -81,7 +81,7 @@ impl<R: tl::RemoteCall<Return = tl::enums::messages::Messages>> IterBuffer<R, Me
                 (m.messages, m.users, m.chats, None)
             }
             Messages::NotModified(_) => {
-                panic!("API returned Messages::NotModified even though hash = 0")
+                return Err(InvocationError::Dropped("unexpected Messages::NotModified"));
             }
         };
 

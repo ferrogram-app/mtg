@@ -89,7 +89,7 @@ async fn map_random_ids_to_messages(
                 })
                 .collect())
         }
-        _ => panic!("API returned something other than Updates so messages can't be mapped"),
+        _ => Err("API returned something other than Updates so messages can't be mapped".into()),
     }
 }
 
@@ -150,7 +150,7 @@ fn input_reply_to(reply_to_msg_id: i32) -> tl::enums::InputReplyTo {
 
 /// Flatten a `messages.Messages` response into its messages, users and chats.
 ///
-/// Panics on `NotModified`, which is only returned when a non-zero `hash` was sent.
+/// `NotModified` (only returned to a non-zero `hash`) yields no messages.
 fn unpack_messages(
     res: tl::enums::messages::Messages,
 ) -> (
@@ -164,9 +164,8 @@ fn unpack_messages(
         Messages::Messages(m) => (m.messages, m.users, m.chats),
         Messages::Slice(m) => (m.messages, m.users, m.chats),
         Messages::ChannelMessages(m) => (m.messages, m.users, m.chats),
-        Messages::NotModified(_) => {
-            panic!("API returned Messages::NotModified even though GetMessages was used")
-        }
+        // only answered to a non-zero `hash`, which we never send: treat as no messages
+        Messages::NotModified(_) => (Vec::new(), Vec::new(), Vec::new()),
     }
 }
 
@@ -443,5 +442,17 @@ impl Client {
             })
             .await?;
         Ok(Media::from_raw(media))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn not_modified_unpacks_to_nothing() {
+        let res = tl::types::messages::MessagesNotModified { count: 3 }.into();
+        let (messages, users, chats) = unpack_messages(res);
+        assert!(messages.is_empty() && users.is_empty() && chats.is_empty());
     }
 }

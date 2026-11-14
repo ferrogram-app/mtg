@@ -80,7 +80,7 @@ impl DialogIter {
                 (d.dialogs, d.messages, d.users, d.chats)
             }
             Dialogs::NotModified(_) => {
-                panic!("API returned Dialogs::NotModified even though hash = 0")
+                return Err(InvocationError::Dropped("unexpected Dialogs::NotModified"));
             }
         };
 
