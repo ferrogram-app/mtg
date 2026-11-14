@@ -156,9 +156,9 @@ pub fn decrypt_config_simple(data: &[u8], key: &Key) -> Option<Vec<u8>> {
     let key_bytes: [u8; 32] = block[..32].try_into().ok()?;
     let cipher = Aes256::new((&key_bytes).into());
     let mut previous: [u8; 16] = block[16..32].try_into().ok()?;
-    for chunk in block[32..].chunks_exact_mut(16) {
-        let ciphertext: [u8; 16] = (&*chunk).try_into().ok()?;
-        cipher.decrypt_block(chunk.try_into().ok()?);
+    for chunk in block[32..].as_chunks_mut::<16>().0 {
+        let ciphertext = *chunk;
+        cipher.decrypt_block(chunk.into());
         chunk.iter_mut().zip(previous).for_each(|(a, b)| *a ^= b);
         previous = ciphertext;
     }
@@ -167,7 +167,7 @@ pub fn decrypt_config_simple(data: &[u8], key: &Key) -> Option<Vec<u8>> {
         return None;
     }
     let len = u32::from_le_bytes(block[32..36].try_into().ok()?) as usize;
-    if len == 0 || len > 208 || len % 4 != 0 {
+    if len == 0 || len > 208 || !len.is_multiple_of(4) {
         return None;
     }
     Some(block[36..240].to_vec())
