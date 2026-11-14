@@ -115,7 +115,7 @@ impl ParticipantIter {
                 let participants = match chat.participants {
                     tl::enums::ChatParticipants::Forbidden(c) => {
                         if let Some(p) = c.self_participant {
-                            buffer.push_back(Participant::from_raw_chat(&mut peers, p));
+                            buffer.extend(Participant::from_raw_chat(&mut peers, p));
                         }
                         return Ok(buffer.len());
                     }
@@ -125,7 +125,7 @@ impl ParticipantIter {
                 buffer.extend(
                     participants
                         .into_iter()
-                        .map(|p| Participant::from_raw_chat(&mut peers, p)),
+                        .filter_map(|p| Participant::from_raw_chat(&mut peers, p)),
                 );
 
                 *total = Some(buffer.len());
@@ -161,7 +161,7 @@ impl ParticipantIter {
                 iter.buffer.extend(
                     participants
                         .into_iter()
-                        .map(|p| Participant::from_raw_channel(&mut peers, p)),
+                        .filter_map(|p| Participant::from_raw_channel(&mut peers, p)),
                 );
 
                 iter.total = Some(count as usize);

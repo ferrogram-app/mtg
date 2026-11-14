@@ -36,7 +36,7 @@ impl Dialog {
         dialog: tl::enums::Dialog,
         messages: &mut Vec<tl::enums::Message>,
         peers: PeerMap,
-    ) -> Self {
+    ) -> Option<Self> {
         // TODO helper utils (ext trait?) to extract data from dialogs or messages
         let peer_id = match dialog {
             tl::enums::Dialog::Dialog(ref dialog) => dialog.peer.clone().into(),
@@ -46,31 +46,30 @@ impl Dialog {
             }
         };
 
-        let peer = peers
-            .get(peer_id)
-            .expect("dialogs use an unknown peer")
-            .clone();
+        // a dialog whose peer the server did not send (or without access info) is skipped
+        let peer = peers.get(peer_id)?.clone();
+        let auth = peer.auth()?;
 
         let message = messages
             .iter()
             .position(|m| peer_from_message(m).is_some_and(|p| PeerId::from(p) == peer_id))
             .map(|i| messages.swap_remove(i));
 
-        Self {
+        Some(Self {
             last_message: message.map(|m| {
                 Message::from_raw(
                     client,
                     m,
                     Some(PeerRef {
                         id: peer.id(),
-                        auth: peer.auth().unwrap(),
+                        auth,
                     }),
                     peers.handle(),
                 )
             }),
             peer,
             raw: dialog,
-        }
+        })
     }
 
     /// The [`Self::peer`]'s identifier.

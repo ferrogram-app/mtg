@@ -105,9 +105,9 @@ impl DialogIter {
         }
 
         self.buffer.extend(
-            dialogs
-                .into_iter()
-                .map(|dialog| Dialog::new(&self.client, dialog, &mut messages, peers.handle())),
+            dialogs.into_iter().filter_map(|dialog| {
+                Dialog::new(&self.client, dialog, &mut messages, peers.handle())
+            }),
         );
 
         // Don't bother updating offsets if this is the last time stuff has to be fetched.

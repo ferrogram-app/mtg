@@ -56,11 +56,10 @@ impl PeerMap {
     }
 
     pub(crate) fn take_user(&mut self, user_id: i64) -> Option<User> {
-        self.take(PeerId::user_unchecked(user_id))
-            .map(|peer| match peer {
-                Peer::User(user) => user,
-                _ => unreachable!(),
-            })
+        match self.take(PeerId::user_unchecked(user_id))? {
+            Peer::User(user) => Some(user),
+            _ => None,
+        }
     }
 
     /// Iterate over the peers and peers in the map.

@@ -148,33 +148,33 @@ impl Participant {
     pub(crate) fn from_raw_channel(
         peers: &mut PeerMap,
         participant: tl::enums::ChannelParticipant,
-    ) -> Self {
+    ) -> Option<Self> {
         use tl::enums::ChannelParticipant as P;
 
         match participant {
-            P::Participant(p) => Self {
-                user: peers.take_user(p.user_id).unwrap(),
+            P::Participant(p) => Some(Self {
+                user: peers.take_user(p.user_id)?,
                 role: Role::User(Normal {
                     date: p.date,
                     inviter_id: None,
                 }),
-            },
-            P::ParticipantSelf(p) => Self {
-                user: peers.take_user(p.user_id).unwrap(),
+            }),
+            P::ParticipantSelf(p) => Some(Self {
+                user: peers.take_user(p.user_id)?,
                 role: Role::User(Normal {
                     date: p.date,
                     inviter_id: Some(p.inviter_id),
                 }),
-            },
-            P::Creator(p) => Self {
-                user: peers.take_user(p.user_id).unwrap(),
+            }),
+            P::Creator(p) => Some(Self {
+                user: peers.take_user(p.user_id)?,
                 role: Role::Creator(Creator {
                     permissions: Permissions::from_raw(p.admin_rights.into()),
                     rank: p.rank,
                 }),
-            },
-            P::Admin(p) => Self {
-                user: peers.take_user(p.user_id).unwrap(),
+            }),
+            P::Admin(p) => Some(Self {
+                user: peers.take_user(p.user_id)?,
                 role: Role::Admin(Admin {
                     can_edit: p.can_edit,
                     inviter_id: p.inviter_id,
@@ -183,11 +183,12 @@ impl Participant {
                     permissions: Permissions::from_raw(p.admin_rights.into()),
                     rank: p.rank,
                 }),
-            },
-            P::Banned(p) => Self {
-                user: match peers.take(PeerId::from(p.peer.clone())).unwrap() {
+            }),
+            P::Banned(p) => Some(Self {
+                user: match peers.take(PeerId::from(p.peer.clone()))? {
                     Peer::User(user) => user,
-                    _ => todo!("figure out how to deal with non-user being banned"),
+                    // a banned channel/chat is not a user participant: skipped
+                    _ => return None,
                 },
                 role: Role::Banned(Banned {
                     left: p.left,
@@ -195,40 +196,40 @@ impl Participant {
                     date: p.date,
                     restrictions: Restrictions::from_raw(p.banned_rights.into()),
                 }),
-            },
-            P::Left(p) => Self {
-                user: match peers.take(PeerId::from(p.peer.clone())).unwrap() {
+            }),
+            P::Left(p) => Some(Self {
+                user: match peers.take(PeerId::from(p.peer.clone()))? {
                     Peer::User(user) => user,
-                    _ => todo!("figure out how to deal with non-user leaving"),
+                    _ => return None,
                 },
                 role: Role::Left(Left {}),
-            },
+            }),
         }
     }
 
     pub(crate) fn from_raw_chat(
         peers: &mut PeerMap,
         participant: tl::enums::ChatParticipant,
-    ) -> Self {
+    ) -> Option<Self> {
         use tl::enums::ChatParticipant as P;
 
         match participant {
-            P::Participant(p) => Self {
-                user: peers.take_user(p.user_id).unwrap(),
+            P::Participant(p) => Some(Self {
+                user: peers.take_user(p.user_id)?,
                 role: Role::User(Normal {
                     date: p.date,
                     inviter_id: Some(p.inviter_id),
                 }),
-            },
-            P::Creator(p) => Self {
-                user: peers.take_user(p.user_id).unwrap(),
+            }),
+            P::Creator(p) => Some(Self {
+                user: peers.take_user(p.user_id)?,
                 role: Role::Creator(Creator {
                     permissions: Permissions::new_full(),
                     rank: None,
                 }),
-            },
-            P::Admin(p) => Self {
-                user: peers.take_user(p.user_id).unwrap(),
+            }),
+            P::Admin(p) => Some(Self {
+                user: peers.take_user(p.user_id)?,
                 role: Role::Admin(Admin {
                     can_edit: true,
                     inviter_id: Some(p.inviter_id),
@@ -237,7 +238,41 @@ impl Participant {
                     permissions: Permissions::new_full(),
                     rank: None,
                 }),
-            },
+            }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mtg_session::storages::MemorySession;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    fn empty_peers() -> PeerMap {
+        PeerMap {
+            map: Arc::new(HashMap::new()),
+            session: mtg_session::storages::erase(Arc::new(MemorySession::default())),
+        }
+    }
+
+    #[test]
+    fn participants_with_unknown_users_are_skipped() {
+        let mut peers = empty_peers();
+        let chat = tl::types::ChatParticipant {
+            user_id: 1,
+            inviter_id: 2,
+            date: 0,
+            rank: None,
+        }
+        .into();
+        assert!(Participant::from_raw_chat(&mut peers, chat).is_none());
+
+        let channel = tl::types::ChannelParticipantLeft {
+            peer: tl::types::PeerChannel { channel_id: 5 }.into(),
+        }
+        .into();
+        assert!(Participant::from_raw_channel(&mut peers, channel).is_none());
     }
 }
