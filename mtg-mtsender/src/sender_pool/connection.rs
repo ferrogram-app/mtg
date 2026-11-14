@@ -186,10 +186,18 @@ impl SenderPoolRunner {
         };
         let stored = self.session.dc_addresses(dc_option.id)?;
         let mut last_error = InvocationError::Dropped("no address to connect to");
-        for address in candidates(primary, &stored, use_ipv6) {
+        let list = match &self.connection_params.mtproxy {
+            // the proxy is the only way in: its own addresses replace the datacenter's
+            Some(proxy) => tokio::net::lookup_host((proxy.host.as_str(), proxy.port))
+                .await
+                .map_err(InvocationError::Io)?
+                .collect(),
+            None => candidates(primary, &stored, use_ipv6),
+        };
+        for address in list {
             let attempt = tokio::time::timeout(
                 CONNECT_TIMEOUT,
-                self.connect_one(address, dc_option.auth_key),
+                self.connect_one(address, dc_option.id, dc_option.auth_key),
             );
             match attempt.await {
                 Ok(Ok((sender, config))) => {
@@ -212,6 +220,7 @@ impl SenderPoolRunner {
     async fn connect_one(
         &self,
         address: SocketAddr,
+        dc_id: i32,
         auth_key: Option<[u8; 256]>,
     ) -> Result<
         (
@@ -220,7 +229,23 @@ impl SenderPoolRunner {
         ),
         InvocationError,
     > {
-        let transport = &self.connection_params.transport;
+        let params = &self.connection_params;
+        let transport = || -> Box<dyn transport::Transport + Send> {
+            match &params.mtproxy {
+                // the dc id goes in the obfuscation head; negative asks for media
+                Some(p) if p.padded => Box::new(transport::Obfuscated::with_proxy(
+                    transport::PaddedIntermediate::new(),
+                    &p.secret,
+                    dc_id as i16,
+                )),
+                Some(p) => Box::new(transport::Obfuscated::with_proxy(
+                    transport::Intermediate::new(),
+                    &p.secret,
+                    dc_id as i16,
+                )),
+                None => (params.transport)(),
+            }
+        };
 
         #[cfg(feature = "proxy")]
         let addr = || {

@@ -76,6 +76,10 @@ pub struct ConnectionParams {
     /// value is ignored.
     pub dns_fallback_domain: Option<String>,
 
+    /// Reach Telegram through this MTProxy instead of the datacenter addresses (the proxy is
+    /// told which datacenter to forward to). Takes the place of `transport`. `None` by default.
+    pub mtproxy: Option<crate::MtProxy>,
+
     #[doc(hidden)]
     pub __non_exhaustive: (),
 }
@@ -165,6 +169,7 @@ impl Default for ConnectionParams {
             updates_channel_capacity: NonZeroUsize::new(100).unwrap(),
             transport: Box::new(|| Box::new(transport::Full::new())),
             dns_fallback_domain: None,
+            mtproxy: None,
             __non_exhaustive: (),
         }
     }

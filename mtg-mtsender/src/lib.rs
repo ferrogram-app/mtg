@@ -27,6 +27,7 @@
 mod configuration;
 mod errors;
 mod fallback;
+mod mtproxy;
 mod net;
 mod sender;
 mod sender_pool;
@@ -41,6 +42,7 @@ pub use fallback::{
 };
 #[cfg(feature = "doh")]
 pub use fallback::{doh, fetch_and_apply};
+pub use mtproxy::{MtProxy, MtProxyError};
 pub use net::ServerAddr;
 pub use sender::{Sender, connect, connect_with_auth, generate_auth_key};
 pub use sender_pool::{SenderPool, SenderPoolFatHandle, SenderPoolHandle, SenderPoolRunner};

@@ -13,3 +13,10 @@ Telegram documentation this crate implements:
 - [Error handling](https://core.telegram.org/api/errors): RPC errors, flood waits
 
 The protocol itself is in `mtg-mtproto`; this crate only moves its bytes over sockets.
+
+## MTProxy
+
+Set `ConnectionParams::mtproxy` to `MtProxy::from_link("tg://proxy?server=…&port=…&secret=…")` (hex or
+base64url secret; plain or `dd` padded) to reach Telegram through an MTProxy: the proxy's addresses
+replace the datacenter's, and the obfuscation head asks it for the right datacenter. Fake-TLS (`ee`)
+secrets are rejected with `MtProxyError::FakeTlsUnsupported` for now.
