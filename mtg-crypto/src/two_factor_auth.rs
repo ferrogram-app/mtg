@@ -212,7 +212,7 @@ mod tests {
     #[test]
     fn check_p_and_g_accepts_a_real_safe_prime() {
         // RFC 3526 group 14: a 2048-bit safe prime with p mod 8 == 7
-        let p = crate::conformance_p14_bytes();
+        let p = crate::tests::conformance::p14_bytes();
         assert!(check_p_and_g(&p, &2));
         assert!(check_p_and_g(&p, &4));
         assert!(!check_p_and_g(&p, &8));
