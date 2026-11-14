@@ -18,5 +18,5 @@ The protocol itself is in `mtg-mtproto`; this crate only moves its bytes over so
 
 Set `ConnectionParams::mtproxy` to `MtProxy::from_link("tg://proxy?server=…&port=…&secret=…")` (hex or
 base64url secret; plain or `dd` padded) to reach Telegram through an MTProxy: the proxy's addresses
-replace the datacenter's, and the obfuscation head asks it for the right datacenter. Fake-TLS (`ee`)
-secrets are rejected with `MtProxyError::FakeTlsUnsupported` for now.
+replace the datacenter's, and the obfuscation head asks it for the right datacenter. Fake-TLS (`ee`+key+domain)
+secrets are supported too: the connection starts with a TLS-looking hello for that domain.

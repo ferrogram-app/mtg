@@ -7,6 +7,7 @@
 // except according to those terms.
 
 mod tcp;
+mod tls;
 
 pub use tcp::NetStream;
 
@@ -20,6 +21,15 @@ pub enum ServerAddr {
         address: std::net::SocketAddr,
         /// The proxy URL (`socks5://[user:password@]host:port`).
         proxy: String,
+    },
+    /// An MTProxy behind fake-TLS: the handshake is done on connect.
+    FakeTls {
+        /// The proxy.
+        address: std::net::SocketAddr,
+        /// The 16 secret bytes.
+        secret: [u8; 16],
+        /// The domain the hello pretends to visit.
+        domain: String,
     },
     /// Proxy address for direct connection.
     Tcp {

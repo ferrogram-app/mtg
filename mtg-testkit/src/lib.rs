@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use mtg_crypto::{AuthKey, ObfuscatedCipher};
 use mtg_mtproto::DequeBuffer;
+use mtg_mtproto::transport::fake_tls::{self, MAX_RECORD_PAYLOAD, RecordDecoder, RecordEncoder};
 use mtg_mtproto::transport::{Full, Intermediate, Tagged, Transport};
 use mtg_tl_types as tl;
 use mtg_tl_types::{Deserializable, Identifiable, RemoteCall, Serializable};
@@ -58,7 +59,7 @@ pub struct FakeServer {
     seen: Arc<Mutex<Vec<&'static str>>>,
     connections: Arc<std::sync::atomic::AtomicUsize>,
     /// `Some(secret)`: behave as an MTProxy (obfuscated2 with this secret) in front of the server.
-    proxy: Option<[u8; 16]>,
+    proxy: Option<([u8; 16], bool)>,
     proxy_dcs: Arc<Mutex<Vec<i16>>>,
 }
 
@@ -95,7 +96,13 @@ impl FakeServer {
     /// connection with this 16-byte `secret` (plain or `dd`), after which the usual MTProto
     /// follows over the intermediate transport. The datacenter id they ask for is recorded.
     pub async fn start_proxy(secret: [u8; 16]) -> FakeServer {
-        Self::start_with(Some(secret)).await
+        Self::start_with(Some((secret, false))).await
+    }
+
+    /// Like [`FakeServer::start_proxy`], with the fake-TLS layer (`ee` secrets) in front: the
+    /// hello is checked against `secret` and answered, and everything after travels in TLS records.
+    pub async fn start_proxy_tls(secret: [u8; 16]) -> FakeServer {
+        Self::start_with(Some((secret, true))).await
     }
 
     /// Starts listening on a free local port.
@@ -103,7 +110,7 @@ impl FakeServer {
         Self::start_with(None).await
     }
 
-    async fn start_with(proxy: Option<[u8; 16]>) -> FakeServer {
+    async fn start_with(proxy: Option<([u8; 16], bool)>) -> FakeServer {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let server = FakeServer {
             addr: listener.local_addr().unwrap(),
@@ -168,14 +175,29 @@ impl FakeServer {
         let mut cipher: Option<ObfuscatedCipher> = None;
         // a padded (`dd`) client appends up to 15 bytes to every packet
         let mut padded = false;
-        if let Some(secret) = self.proxy {
-            let mut head = [0u8; 64];
-            if sock.read_exact(&mut head).await.is_err() {
-                return;
+        let mut tls = None;
+        let mut leftover = Vec::new();
+        if let Some((secret, fake_tls)) = self.proxy {
+            if fake_tls {
+                match tls_handshake(&mut sock, &secret).await {
+                    Some(dec) => tls = Some(dec),
+                    None => return,
+                }
             }
+            let mut head = Vec::new();
+            let mut chunk = [0u8; 4096];
+            while head.len() < 64 {
+                match read_more(&mut sock, &mut tls, &mut chunk).await {
+                    Some(n) => head.extend_from_slice(&chunk[..n]),
+                    None => return,
+                }
+            }
+            leftover = head.split_off(64);
+            let mut head: [u8; 64] = head.try_into().unwrap();
             let rev: [u8; 64] = std::array::from_fn(|i| head[63 - i]);
             let mut c = ObfuscatedCipher::with_secret(&rev, &secret);
             c.decrypt(&mut head);
+            c.decrypt(&mut leftover);
             padded = head[56..60] == [0xdd; 4];
             assert!(
                 padded || head[56..60] == [0xee; 4],
@@ -192,18 +214,22 @@ impl FakeServer {
             transport = Box::new(inter);
             cipher = Some(c);
         }
-        let mut inbuf = Vec::new();
+        let mut encoder = RecordEncoder::established();
+        let mut have_leftover = !leftover.is_empty();
+        let mut inbuf = leftover;
         let mut chunk = [0u8; 4096];
         let mut msg_counter = 0u64;
         loop {
-            let n = match sock.read(&mut chunk).await {
-                Ok(0) | Err(_) => return,
-                Ok(n) => n,
-            };
-            if let Some(c) = cipher.as_mut() {
-                c.decrypt(&mut chunk[..n]);
+            // bytes the head read already delivered are tried before reading more
+            if !std::mem::take(&mut have_leftover) {
+                let Some(n) = read_more(&mut sock, &mut tls, &mut chunk).await else {
+                    return;
+                };
+                if let Some(c) = cipher.as_mut() {
+                    c.decrypt(&mut chunk[..n]);
+                }
+                inbuf.extend_from_slice(&chunk[..n]);
             }
-            inbuf.extend_from_slice(&chunk[..n]);
             while let Ok(off) = transport.unpack(&mut inbuf) {
                 let mut frame = inbuf[off.data_range.clone()].to_vec();
                 inbuf.drain(..off.next_offset);
@@ -221,7 +247,15 @@ impl FakeServer {
                             let mut buf = DequeBuffer::with_capacity(junk.len(), 32);
                             buf.extend_back(&junk);
                             transport.pack(&mut buf);
-                            if write(&mut sock, &mut cipher, buf.as_mut()).await.is_err() {
+                            if write(
+                                &mut sock,
+                                &mut cipher,
+                                tls.is_some().then_some(&mut encoder),
+                                buf.as_mut(),
+                            )
+                            .await
+                            .is_err()
+                            {
                                 return;
                             }
                             continue;
@@ -239,7 +273,15 @@ impl FakeServer {
                     let mut buf = DequeBuffer::with_capacity(wire.len(), 32);
                     buf.extend_back(&wire);
                     transport.pack(&mut buf);
-                    if write(&mut sock, &mut cipher, buf.as_mut()).await.is_err() {
+                    if write(
+                        &mut sock,
+                        &mut cipher,
+                        tls.is_some().then_some(&mut encoder),
+                        buf.as_mut(),
+                    )
+                    .await
+                    .is_err()
+                    {
                         return;
                     }
                 }
@@ -367,12 +409,73 @@ impl FakeServer {
 async fn write(
     sock: &mut tokio::net::TcpStream,
     cipher: &mut Option<ObfuscatedCipher>,
+    records: Option<&mut RecordEncoder>,
     bytes: &mut [u8],
 ) -> std::io::Result<()> {
     if let Some(c) = cipher {
         c.encrypt(bytes);
     }
-    sock.write_all(bytes).await
+    let Some(encoder) = records else {
+        return sock.write_all(bytes).await;
+    };
+    let mut wire = Vec::new();
+    for part in bytes.chunks(MAX_RECORD_PAYLOAD) {
+        encoder.encode(part, &mut wire);
+    }
+    sock.write_all(&wire).await
+}
+
+/// Reads from the socket; with fake-TLS on, what comes back is the payload of the records.
+async fn read_more(
+    sock: &mut tokio::net::TcpStream,
+    tls: &mut Option<RecordDecoder>,
+    buf: &mut [u8],
+) -> Option<usize> {
+    loop {
+        let n = sock.read(buf).await.ok().filter(|n| *n > 0)?;
+        let Some(dec) = tls else {
+            return Some(n);
+        };
+        match dec.decode(&mut buf[..n]) {
+            Ok(0) => continue,
+            Ok(m) => return Some(m),
+            Err(_) => return None,
+        }
+    }
+}
+
+/// Reads the ClientHello, checks its digest against `secret`, answers it and skips the client's
+/// change-cipher-spec. `None` closes the connection (wrong secret, not a hello).
+async fn tls_handshake(
+    sock: &mut tokio::net::TcpStream,
+    secret: &[u8; 16],
+) -> Option<RecordDecoder> {
+    let mut header = [0u8; 5];
+    sock.read_exact(&mut header).await.ok()?;
+    let mut hello = header.to_vec();
+    hello.resize(5 + u16::from_be_bytes([header[3], header[4]]) as usize, 0);
+    sock.read_exact(&mut hello[5..]).await.ok()?;
+    let sent: [u8; 32] = hello.get(11..43)?.try_into().ok()?;
+    let mut zeroed = hello.clone();
+    zeroed[11..43].fill(0);
+    let want = mtg_crypto::hmac_sha256(secret, &[&zeroed]);
+    // the last four bytes carry the client's clock; the rest must match exactly
+    if want[..28] != sent[..28] {
+        return None;
+    }
+    let mut seed = 0x2545_f491u32;
+    let mut fill = |b: &mut [u8]| {
+        for x in b {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *x = (seed >> 24) as u8;
+        }
+    };
+    sock.write_all(&fake_tls::server_hello(secret, &hello, &mut fill))
+        .await
+        .ok()?;
+    let mut ccs = [0u8; 6];
+    sock.read_exact(&mut ccs).await.ok()?;
+    (ccs == [0x14, 3, 3, 0, 1, 1]).then(RecordDecoder::default)
 }
 
 /// Client-to-server direction (x = 0): `decrypt_data_v2` derives for server-to-client (x = 8), so it is given

@@ -249,14 +249,30 @@ impl SenderPoolRunner {
 
         #[cfg(feature = "proxy")]
         let addr = || {
-            if let Some(proxy) = self.connection_params.proxy_url.clone() {
+            if let Some((secret, domain)) = fake_tls(&self.connection_params) {
+                ServerAddr::FakeTls {
+                    address,
+                    secret,
+                    domain,
+                }
+            } else if let Some(proxy) = self.connection_params.proxy_url.clone() {
                 ServerAddr::Proxied { address, proxy }
             } else {
                 ServerAddr::Tcp { address }
             }
         };
         #[cfg(not(feature = "proxy"))]
-        let addr = || ServerAddr::Tcp { address };
+        let addr = || {
+            if let Some((secret, domain)) = fake_tls(&self.connection_params) {
+                ServerAddr::FakeTls {
+                    address,
+                    secret,
+                    domain,
+                }
+            } else {
+                ServerAddr::Tcp { address }
+            }
+        };
 
         let init_connection = tl::functions::InvokeWithLayer {
             layer: tl::LAYER,
@@ -332,4 +348,10 @@ impl SenderPoolRunner {
         }
         Ok(())
     }
+}
+
+/// The secret and domain when the configured MTProxy wants fake-TLS.
+fn fake_tls(params: &crate::ConnectionParams) -> Option<([u8; 16], String)> {
+    let proxy = params.mtproxy.as_ref()?;
+    Some((proxy.secret, proxy.tls_domain.clone()?))
 }

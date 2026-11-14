@@ -12,8 +12,11 @@ pub struct MtProxy {
     pub port: u16,
     /// The 16 secret bytes.
     pub secret: [u8; 16],
-    /// The secret had the `dd` prefix: use the padded intermediate transport.
+    /// The secret had the `dd` or `ee` prefix: use the padded intermediate transport.
     pub padded: bool,
+    /// The secret had the `ee` prefix: wrap the connection in fake-TLS, pretending to visit
+    /// this domain.
+    pub tls_domain: Option<String>,
 }
 
 /// Why a proxy link or secret was rejected.
@@ -23,8 +26,6 @@ pub enum MtProxyError {
     BadLink,
     /// The secret is not hex or base64url, or has a wrong length.
     BadSecret,
-    /// The secret starts with `ee` (fake-TLS), which is not supported yet.
-    FakeTlsUnsupported,
 }
 
 impl std::fmt::Display for MtProxyError {
@@ -32,7 +33,6 @@ impl std::fmt::Display for MtProxyError {
         f.write_str(match self {
             Self::BadLink => "not a valid MTProxy link",
             Self::BadSecret => "invalid MTProxy secret",
-            Self::FakeTlsUnsupported => "fake-TLS (ee) MTProxy secrets are not supported",
         })
     }
 }
@@ -57,28 +57,34 @@ impl MtProxy {
         let port = get("port")
             .and_then(|p| p.parse().ok())
             .ok_or(MtProxyError::BadLink)?;
-        let (secret, padded) = parse_secret(get("secret").ok_or(MtProxyError::BadLink)?)?;
+        let (secret, padded, tls_domain) =
+            parse_secret(get("secret").ok_or(MtProxyError::BadLink)?)?;
         Ok(Self {
             host: host.to_string(),
             port,
             secret,
             padded,
+            tls_domain,
         })
     }
 }
 
-/// Decodes a secret given as hex or base64url: 16 bytes, or `dd` + 16 bytes (padded).
-fn parse_secret(text: &str) -> Result<([u8; 16], bool), MtProxyError> {
+/// Decodes a secret given as hex or base64url: 16 bytes, `dd` + 16 bytes (padded) or
+/// `ee` + 16 bytes + a domain (fake-TLS).
+fn parse_secret(text: &str) -> Result<([u8; 16], bool, Option<String>), MtProxyError> {
     let bytes = opt_from_hex(text)
         .or_else(|| base64url(text))
         .ok_or(MtProxyError::BadSecret)?;
-    let (body, padded) = match bytes.len() {
-        16 => (&bytes[..], false),
-        17 if bytes[0] == 0xdd => (&bytes[1..], true),
-        n if n > 17 && bytes[0] == 0xee => return Err(MtProxyError::FakeTlsUnsupported),
+    let (body, padded, domain) = match bytes.len() {
+        16 => (&bytes[..], false, None),
+        17 if bytes[0] == 0xdd => (&bytes[1..], true, None),
+        n if n > 17 && bytes[0] == 0xee => {
+            let domain = std::str::from_utf8(&bytes[17..]).map_err(|_| MtProxyError::BadSecret)?;
+            (&bytes[1..17], true, Some(domain.to_string()))
+        }
         _ => return Err(MtProxyError::BadSecret),
     };
-    Ok((body.try_into().unwrap(), padded))
+    Ok((body.try_into().unwrap(), padded, domain))
 }
 
 fn base64url(text: &str) -> Option<Vec<u8>> {
@@ -143,6 +149,18 @@ mod tests {
     }
 
     #[test]
+    fn fake_tls_secret_carries_the_domain() {
+        let domain: String = "example.com".bytes().map(|b| format!("{b:02x}")).collect();
+        let p = MtProxy::from_link(&format!(
+            "tg://proxy?server=h&port=443&secret=ee{HEX}{domain}"
+        ))
+        .unwrap();
+        assert!(p.padded);
+        assert_eq!(p.tls_domain.as_deref(), Some("example.com"));
+        assert_eq!(p.secret[15], 15);
+    }
+
+    #[test]
     fn rejects() {
         let bad = |l: &str| MtProxy::from_link(l).unwrap_err();
         assert_eq!(bad("https://example.com/"), MtProxyError::BadLink);
@@ -165,8 +183,14 @@ mod tests {
             MtProxyError::BadSecret
         );
         assert_eq!(
-            bad(&format!("tg://proxy?server=h&port=1&secret=ee{HEX}7777")),
-            MtProxyError::FakeTlsUnsupported
+            bad(&format!("tg://proxy?server=h&port=1&secret=ee{HEX}ff")),
+            MtProxyError::BadSecret,
+            "domain must be UTF-8"
+        );
+        assert_eq!(
+            bad(&format!("tg://proxy?server=h&port=1&secret=ee{HEX}")),
+            MtProxyError::BadSecret,
+            "ee needs a domain"
         );
         assert!(!bad("tg://proxy?server=h").to_string().is_empty());
     }

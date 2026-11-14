@@ -197,10 +197,20 @@ async fn connector_reports_the_last_error_when_every_address_is_dead() {
 async fn through_proxy(secret_text: &str, padded: bool) {
     let secret: [u8; 16] = std::array::from_fn(|i| i as u8 * 3 + 1);
     let server = FakeServer::start_proxy(secret).await;
+    run_through(server, secret, secret_text, "", padded).await;
+}
+
+async fn run_through(
+    server: FakeServer,
+    secret: [u8; 16],
+    prefix: &str,
+    suffix: &str,
+    padded: bool,
+) {
     mock_app_config(&server);
     let hex: String = secret.iter().map(|b| format!("{b:02x}")).collect();
     let link = format!(
-        "tg://proxy?server=127.0.0.1&port={}&secret={secret_text}{hex}",
+        "tg://proxy?server=127.0.0.1&port={}&secret={prefix}{hex}{suffix}",
         server.addr.port()
     );
     let proxy = mtg_mtsender::MtProxy::from_link(&link).unwrap();
@@ -234,4 +244,37 @@ async fn mtproxy_plain_secret_end_to_end() {
 #[tokio::test(flavor = "multi_thread")]
 async fn mtproxy_padded_secret_end_to_end() {
     through_proxy("dd", true).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mtproxy_fake_tls_end_to_end() {
+    let secret: [u8; 16] = std::array::from_fn(|i| i as u8 * 5 + 2);
+    let server = FakeServer::start_proxy_tls(secret).await;
+    let domain: String = "cdn.example.org"
+        .bytes()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    run_through(server, secret, "ee", &domain, true).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fake_tls_with_the_wrong_secret_fails_instead_of_hanging() {
+    let secret: [u8; 16] = [3; 16];
+    let server = FakeServer::start_proxy_tls(secret).await;
+    let wrong: String = [4u8; 16].iter().map(|b| format!("{b:02x}")).collect();
+    let link = format!(
+        "tg://proxy?server=127.0.0.1&port={}&secret=ee{wrong}{}",
+        server.addr.port(),
+        "61".repeat(3)
+    );
+    let params = mtg_mtsender::ConnectionParams {
+        mtproxy: Some(mtg_mtsender::MtProxy::from_link(&link).unwrap()),
+        retry_policy: Box::new(mtg_mtsender::NoRetries),
+        ..Default::default()
+    };
+    let pool = SenderPool::with_configuration(server.session(), 1, params);
+    tokio::spawn(pool.runner.run());
+    assert!(call(&pool.handle).await.is_err());
+    assert!(server.proxy_dcs().is_empty());
+    pool.handle.quit();
 }

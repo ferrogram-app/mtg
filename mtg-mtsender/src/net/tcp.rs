@@ -6,25 +6,41 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 pub use tokio::net::tcp::{ReadHalf, WriteHalf};
+
+use super::tls::{TlsRead, TlsStream, TlsWrite};
 use tracing::info;
 
 use super::ServerAddr;
 
 pub enum NetStream {
     Tcp(TcpStream),
+    Tls(TlsStream),
     #[cfg(feature = "proxy")]
     ProxySocks5(tokio_socks::tcp::Socks5Stream<TcpStream>),
 }
 
 impl NetStream {
-    pub(crate) fn split(&mut self) -> (ReadHalf<'_>, WriteHalf<'_>) {
+    pub(crate) fn split(&mut self) -> (NetReader<'_>, NetWriter<'_>) {
         match self {
-            Self::Tcp(stream) => stream.split(),
+            Self::Tcp(stream) => {
+                let (r, w) = stream.split();
+                (NetReader::Plain(r), NetWriter::Plain(w))
+            }
             #[cfg(feature = "proxy")]
-            Self::ProxySocks5(stream) => stream.split(),
+            Self::ProxySocks5(stream) => {
+                let (r, w) = stream.split();
+                (NetReader::Plain(r), NetWriter::Plain(w))
+            }
+            Self::Tls(stream) => {
+                let (r, w) = stream.split();
+                (NetReader::Tls(r), NetWriter::Tls(w))
+            }
         }
     }
 
@@ -32,6 +48,18 @@ impl NetStream {
         info!("connecting...");
         match addr {
             ServerAddr::Tcp { address } => Ok(NetStream::Tcp(TcpStream::connect(address).await?)),
+            ServerAddr::FakeTls {
+                address,
+                secret,
+                domain,
+            } => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs() as i32);
+                Ok(NetStream::Tls(
+                    TlsStream::connect(*address, secret, domain, now).await?,
+                ))
+            }
             #[cfg(feature = "proxy")]
             ServerAddr::Proxied { address, proxy } => {
                 Self::connect_proxy_stream(address, proxy).await
@@ -110,8 +138,59 @@ impl NetStream {
     pub(crate) async fn disconnect(&mut self) -> std::io::Result<()> {
         match self {
             Self::Tcp(stream) => stream.shutdown().await,
+            Self::Tls(stream) => stream.shutdown().await,
             #[cfg(feature = "proxy")]
             Self::ProxySocks5(stream) => stream.shutdown().await,
+        }
+    }
+}
+
+pub enum NetReader<'a> {
+    Plain(ReadHalf<'a>),
+    Tls(TlsRead<'a>),
+}
+
+pub enum NetWriter<'a> {
+    Plain(WriteHalf<'a>),
+    Tls(TlsWrite<'a>),
+}
+
+impl AsyncRead for NetReader<'_> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(r) => Pin::new(r).poll_read(cx, buf),
+            Self::Tls(r) => Pin::new(r).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for NetWriter<'_> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Self::Plain(w) => Pin::new(w).poll_write(cx, buf),
+            Self::Tls(w) => Pin::new(w).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(w) => Pin::new(w).poll_flush(cx),
+            Self::Tls(w) => Pin::new(w).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(w) => Pin::new(w).poll_shutdown(cx),
+            Self::Tls(w) => Pin::new(w).poll_shutdown(cx),
         }
     }
 }
