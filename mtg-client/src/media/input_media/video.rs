@@ -119,7 +119,7 @@ impl InputVideo {
 
     /// Sets the cover of the video.
     ///
-    /// tip: [`tl::enums::InputPhoto`] can get from [`super::Photo::to_raw_input_photo`].
+    /// tip: [`tl::enums::InputPhoto`] can get from [`crate::media::Photo::to_raw_input_photo`].
     pub fn video_cover(mut self, video_cover: Option<tl::enums::InputPhoto>) -> Self {
         self.video_cover = video_cover;
         self
