@@ -41,7 +41,7 @@ pub struct PeerAuth(i64);
 /// Ocap-style reference to a peer object, a peer object capability, bundling the identity
 /// of a peer (its [`PeerId`]) with authority over it (as [`PeerAuth`]), to allow fluent use.
 ///
-/// This type implements conversion to [`tl::enums::InputPeer`] and derivatives.
+/// This type implements conversion to [`mtg_tl_types::enums::InputPeer`] and derivatives.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct PeerRef {
@@ -57,11 +57,11 @@ pub struct PeerRef {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum PeerKind {
-    /// The peer identity belongs to a [`tl::enums::User`] or the self-user without knowing its identifier.
+    /// The peer identity belongs to a [`mtg_tl_types::enums::User`] or the self-user without knowing its identifier.
     User,
-    /// The peer identity belongs to a [`tl::types::Chat`] or one of its derivatives.
+    /// The peer identity belongs to a [`mtg_tl_types::types::Chat`] or one of its derivatives.
     Chat,
-    /// The peer identity belongs to a [`tl::types::Channel`] or one of its derivatives.
+    /// The peer identity belongs to a [`mtg_tl_types::types::Channel`] or one of its derivatives.
     Channel,
 }
 
@@ -111,13 +111,13 @@ pub enum PeerInfo {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ChannelKind {
-    /// Value used for a channel with its [`tl::types::Channel::broadcast`] flag set to `true`.
+    /// Value used for a channel with its [`mtg_tl_types::types::Channel::broadcast`] flag set to `true`.
     Broadcast = 1,
-    /// Value used for a channel with its [`tl::types::Channel::megagroup`] flag set to `true`.
+    /// Value used for a channel with its [`mtg_tl_types::types::Channel::megagroup`] flag set to `true`.
     Megagroup,
-    /// Value used for a channel with its [`tl::types::Channel::gigagroup`] flag set to `true`.
+    /// Value used for a channel with its [`mtg_tl_types::types::Channel::gigagroup`] flag set to `true`.
     Gigagroup,
-    /// Value used for a channel of [`tl::types::Community`] or [`tl::types::CommunityForbidden`] type.
+    /// Value used for a channel of [`mtg_tl_types::types::Community`] or [`mtg_tl_types::types::CommunityForbidden`] type.
     Community,
 }
 
