@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "mtg-calls",
     "mtg-client",
     "mtg-crypto",
     "mtg-mtproto",

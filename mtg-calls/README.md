@@ -1,11 +1,20 @@
 # mtg-calls
 
-Planned, not started. Call signalling and key exchange: `phone.requestCall`, `acceptCall`, `confirmCall`,
-`discardCall`, the `UpdatePhoneCall*` updates, Diffie-Hellman key and the emoji fingerprint, relay (reflector)
-connection data, group calls (`phone.joinGroupCall`). The media stack (audio, video, WebRTC) is a separate decision.
+Sans-IO signalling for one-to-one Telegram calls: the state machine, the key exchange and the
+emoji fingerprint. It does not touch the network or the media: you invoke the requests it returns
+and feed it the answers and the `updatePhoneCall` updates.
 
-Telegram documentation this crate will implement:
+Docs: <https://core.telegram.org/api/end-to-end/voice-calls>, <https://core.telegram.org/api/end-to-end/video-calls>
 
-- [Voice calls](https://core.telegram.org/api/end-to-end/voice-calls)
-- [Video calls](https://core.telegram.org/api/end-to-end/video-calls)
-- [Group calls](https://core.telegram.org/api/calls)
+- `Calls::request` / `on_request_result`: place a call (`phone.requestCall`, `g_a_hash` first).
+- `handle_update`: `Incoming`, `Ringing`, `Connected` (key, emoji, relay endpoints, protocol,
+  `custom_parameters`), `Ended`, `Failed` (bad hash, key or fingerprint; a discard is queued).
+- `accept`, `received`, `discard`, `rate`, `debug`: `phone.acceptCall`, `receivedCall`,
+  `discardCall`, `setCallRating`, `saveCallDebug`.
+- `emoji(&Key)`: the four emojis of the key (SHA-256 of the key, as the official client).
+- DH group, exchange and `Key` come from `mtg-secret`.
+
+Updates that arrive before the `requestCall` answer are held (8 at most) and replayed.
+
+Not done: group calls (`phone.joinGroupCall` needs a WebRTC offer), conference calls, the media
+stack (the application binds a call library with `Connected`). No live Telegram run.

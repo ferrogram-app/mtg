@@ -1,0 +1,21 @@
+[package]
+name = "mtg-calls"
+version = "0.0.1"
+license = "MIT OR Apache-2.0"
+description = """
+Telegram one-to-one calls: signalling, key exchange, emoji fingerprint, relay endpoints.
+"""
+repository = "https://github.com/ferrogram-app/mtg"
+keywords = ["telegram", "voip"]
+categories = ["cryptography"]
+edition = "2024"
+publish = false
+
+[dependencies]
+getrandom = "0.4.3"
+mtg-crypto = { path = "../mtg-crypto", version = "0.0.1" }
+mtg-secret = { path = "../mtg-secret", version = "0.0.1" }
+mtg-tl-types = { path = "../mtg-tl-types", version = "0.0.1" }
+
+[dev-dependencies]
+toml = "1.2.1"
