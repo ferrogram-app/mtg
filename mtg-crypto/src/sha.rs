@@ -34,6 +34,27 @@ macro_rules! sha256 (
     })
 );
 
+/// SHA-1 of the concatenation of `parts` (for callers that cannot use the [`sha1!`] macro, which
+/// needs the `sha1` crate in the caller).
+pub fn sha1_parts(parts: &[&[u8]]) -> [u8; 20] {
+    use sha1::{Digest, Sha1};
+    let mut hasher = Sha1::new();
+    for part in parts {
+        hasher.update(part);
+    }
+    hasher.finalize().into()
+}
+
+/// SHA-256 of the concatenation of `parts` (see [`sha1_parts`]).
+pub fn sha256_parts(parts: &[&[u8]]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update(part);
+    }
+    hasher.finalize().into()
+}
+
 /// HMAC-SHA256 of `data` under `key` (used by the fake-TLS MTProxy handshake).
 pub fn hmac_sha256(key: &[u8], data: &[&[u8]]) -> [u8; 32] {
     use hmac::{Hmac, KeyInit, Mac};
@@ -46,7 +67,14 @@ pub fn hmac_sha256(key: &[u8], data: &[&[u8]]) -> [u8; 32] {
 
 #[cfg(test)]
 mod tests {
-    use super::hmac_sha256;
+    use super::{hmac_sha256, sha1_parts, sha256_parts};
+
+    #[test]
+    fn the_part_helpers_hash_the_concatenation() {
+        assert_eq!(sha1_parts(&[b"ab", b"c"]), crate::sha1!(b"abc"));
+        assert_eq!(sha256_parts(&[b"ab", b"c"]), crate::sha256!(b"abc"));
+        assert_eq!(sha256_parts(&[]), crate::sha256!(b""));
+    }
 
     #[test]
     fn rfc4231_case_2() {

@@ -18,7 +18,7 @@ pub mod hex;
 mod obfuscated;
 pub mod rsa;
 mod sha;
-pub use sha::hmac_sha256;
+pub use sha::{hmac_sha256, sha1_parts, sha256_parts};
 pub mod two_factor_auth;
 
 use std::fmt;
