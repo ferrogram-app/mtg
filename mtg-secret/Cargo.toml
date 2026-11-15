@@ -1,0 +1,22 @@
+[package]
+name = "mtg-secret"
+version = "0.0.1"
+license = "MIT OR Apache-2.0"
+description = """
+Telegram secret chats (end-to-end encryption): key exchange, message layer, PFS rekeying.
+"""
+repository = "https://github.com/ferrogram-app/mtg"
+keywords = ["telegram", "e2e"]
+categories = ["cryptography"]
+edition = "2024"
+publish = false
+
+[dependencies]
+getrandom = "0.4.3"
+md5 = "0.8"
+mtg-crypto = { path = "../mtg-crypto", version = "0.0.1" }
+mtg-tl-types = { path = "../mtg-tl-types", version = "0.0.1" }
+num-bigint = "0.5"
+
+[dev-dependencies]
+toml = "1.2.1"

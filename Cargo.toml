@@ -4,6 +4,7 @@ members = [
     "mtg-crypto",
     "mtg-mtproto",
     "mtg-mtsender",
+    "mtg-secret",
     "mtg-session",
     "mtg-tl-gen",
     "mtg-tl-parser",
