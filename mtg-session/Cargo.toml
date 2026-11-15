@@ -1,6 +1,6 @@
 [package]
 name = "mtg-session"
-version = "0.12.0"
+version = "0.0.1"
 authors = ["Lonami Exo <totufals@hotmail.com>"]
 license = "MIT OR Apache-2.0"
 description = """
@@ -17,7 +17,7 @@ sqlite-storage = ["dep:libsql", "dep:tokio"]
 serde = ["dep:serde", "dep:serde_with"]
 
 [dependencies]
-mtg-tl-types = { path = "../mtg-tl-types", version = "0.12.0" }
+mtg-tl-types = { path = "../mtg-tl-types", version = "0.0.1" }
 
 libsql = { version = "0.10.0", default-features = false, features = ["core"], optional = true }
 tokio = { version = "1.54.1", default-features = false, features = ["sync"], optional = true }

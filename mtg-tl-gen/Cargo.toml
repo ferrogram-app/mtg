@@ -1,6 +1,6 @@
 [package]
 name = "mtg-tl-gen"
-version = "0.12.0"
+version = "0.0.1"
 authors = ["Lonami Exo <totufals@hotmail.com>"]
 license = "MIT OR Apache-2.0"
 description = """
@@ -12,7 +12,7 @@ categories = []
 edition = "2024"
 
 [dependencies]
-mtg-tl-parser = { path = "../mtg-tl-parser", version = "2.0.0" }
+mtg-tl-parser = { path = "../mtg-tl-parser", version = "0.0.1" }
 
 [dev-dependencies]
 toml = "1.2.1"

@@ -1,6 +1,6 @@
 [package]
 name = "mtg-tl-parser"
-version = "2.0.0"
+version = "0.0.1"
 authors = ["Lonami Exo <totufals@hotmail.com>"]
 license = "MIT OR Apache-2.0"
 description = """
