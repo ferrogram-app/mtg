@@ -44,6 +44,16 @@ impl SenderPoolRunner {
                 if is_auth_key_duplicated(&error) {
                     self.forget_auth_key(dc_id).await;
                 }
+                if is_unknown_auth_key(&error) {
+                    let streak = self.unknown_key.entry(dc_id).or_default();
+                    *streak += 1;
+                    if *streak >= UNKNOWN_KEY_LIMIT {
+                        self.unknown_key.remove(&dc_id);
+                        self.forget_auth_key(dc_id).await;
+                    }
+                } else {
+                    self.unknown_key.remove(&dc_id);
+                }
                 let retry_context = RetryContext {
                     fail_count,
                     slept_so_far,

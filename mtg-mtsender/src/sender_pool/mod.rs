@@ -6,6 +6,7 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
+use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::ops::{ControlFlow, Deref};
 use std::sync::Arc;
@@ -123,6 +124,8 @@ pub struct SenderPoolRunner {
     updates_tx: mpsc::Sender<UpdatesLike>,
     connections: Vec<ConnectionInfo>,
     time_offset: Arc<AtomicI32>,
+    /// Consecutive transport `-404` answers per DC (see [`UNKNOWN_KEY_LIMIT`]).
+    unknown_key: HashMap<i32, u32>,
     #[cfg(feature = "doh")]
     dns_fallback_tried: bool,
     connection_pool: JoinSet<Result<(), ReadError>>,
@@ -291,6 +294,7 @@ impl SenderPool {
                 updates_tx,
                 connections: Vec::new(),
                 time_offset: Arc::new(AtomicI32::new(0)),
+                unknown_key: HashMap::new(),
                 #[cfg(feature = "doh")]
                 dns_fallback_tried: false,
                 connection_pool: JoinSet::new(),
@@ -340,6 +344,23 @@ impl SenderPoolRunner {
         self.connections.clear(); // drop all channels to cause the `run_sender` loops to stop
         self.connection_pool.join_all().await;
     }
+}
+
+/// After this many `-404` transport answers in a row the key is considered gone and dropped.
+/// The official client only reconnects (it drops the key on `-404` for PFS/CDN keys), which would
+/// loop forever on a key the server forgot.
+const UNKNOWN_KEY_LIMIT: u32 = 3;
+
+/// The transport answered `-404`: the server does not know our auth key.
+fn is_unknown_auth_key(error: &InvocationError) -> bool {
+    use mtg_mtproto::{mtp::DeserializeError, transport::Error};
+    matches!(
+        error,
+        InvocationError::Transport(Error::BadStatus { status: 404 })
+            | InvocationError::Deserialize(DeserializeError::Transport(Error::BadStatus {
+                status: 404
+            }))
+    )
 }
 
 /// `406 AUTH_KEY_DUPLICATED`: the session was already invalidated by the server, a new auth key

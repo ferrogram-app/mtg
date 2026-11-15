@@ -63,6 +63,55 @@ async fn the_runner_forgets_the_key_of_a_duplicated_session() {
     assert!(session.dc_option(2).unwrap().unwrap().auth_key.is_some());
 }
 
+#[test]
+fn only_a_transport_404_means_an_unknown_key() {
+    use mtg_mtproto::{mtp::DeserializeError, transport::Error};
+    assert!(is_unknown_auth_key(&InvocationError::Transport(
+        Error::BadStatus { status: 404 }
+    )));
+    assert!(is_unknown_auth_key(&InvocationError::Deserialize(
+        DeserializeError::Transport(Error::BadStatus { status: 404 })
+    )));
+    assert!(!is_unknown_auth_key(&InvocationError::Transport(
+        Error::BadStatus { status: 429 }
+    )));
+    assert!(!is_unknown_auth_key(&InvocationError::InvalidDc));
+}
+
+#[tokio::test]
+async fn repeated_404_drops_the_key() {
+    use mtg_mtproto::transport::Error;
+    let mut session = mtg_session::SessionData::default();
+    let mut dc = empty();
+    dc.auth_key = Some([7; 256]);
+    session.dc_options.insert(2, dc);
+    let session = Arc::new(mtg_session::storages::MemorySession::from(session));
+    let mut runner = SenderPool::new(Arc::clone(&session), 1).runner;
+    let mut check = async |error: InvocationError| {
+        let (tx, _rx) = oneshot::channel();
+        let _ = runner
+            .process_request(Request::CheckRetry {
+                dc_id: 2,
+                error,
+                fail_count: NonZeroU32::MIN,
+                slept_so_far: Duration::ZERO,
+                tx,
+            })
+            .await;
+    };
+    let bad = || InvocationError::Transport(Error::BadStatus { status: 404 });
+    let has_key = || session.dc_option(2).unwrap().unwrap().auth_key.is_some();
+    // two in a row, then another error resets the count
+    check(bad()).await;
+    check(bad()).await;
+    check(rpc(420, "FLOOD_WAIT")).await;
+    check(bad()).await;
+    check(bad()).await;
+    assert!(has_key());
+    check(bad()).await;
+    assert!(!has_key());
+}
+
 fn empty() -> DcOption {
     DcOption {
         id: 2,
