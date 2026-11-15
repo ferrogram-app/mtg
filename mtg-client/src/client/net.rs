@@ -113,6 +113,16 @@ impl Client {
         self.0.handle.invoke_in_dc(dc_id, request).await
     }
 
+    /// Like [`Self::invoke_in_dc`], over the media-only addresses of the DC when it has any
+    /// (what the official client uses for file transfer). Falls back to the ordinary connection.
+    pub async fn invoke_media_in_dc<R: tl::RemoteCall>(
+        &self,
+        dc_id: i32,
+        request: &R,
+    ) -> Result<R::Return, InvocationError> {
+        self.0.handle.invoke_media_in_dc(dc_id, request).await
+    }
+
     pub(crate) async fn copy_auth_to_dc(&self, target_dc_id: i32) -> Result<(), InvocationError> {
         let mut auth_copied_to_dcs = self.0.auth_copied_to_dcs.lock().await;
         if auth_copied_to_dcs.contains(&target_dc_id) {

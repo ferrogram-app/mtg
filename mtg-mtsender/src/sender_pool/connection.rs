@@ -16,21 +16,34 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 impl SenderPoolRunner {
     pub(super) async fn process_request(&mut self, request: Request) -> ControlFlow<()> {
         match request {
-            Request::Invoke { dc_id, body, tx } => {
-                let connection = match self
-                    .connections
-                    .iter()
-                    .find(|connection| connection.dc_id == dc_id)
-                {
-                    Some(connection) => connection,
-                    None => match self.create_connection(dc_id).await {
-                        Ok(x) => x,
-                        Err(e) => {
-                            let _ = tx.send(Err(e));
-                            return ControlFlow::Continue(());
+            Request::Invoke {
+                dc_id,
+                media,
+                body,
+                tx,
+            } => {
+                let media = media && self.has_media_route(dc_id);
+                let index = match self.find_or_connect(dc_id, media).await {
+                    Ok(index) => index,
+                    Err(e) if media => {
+                        // the media addresses do not work: forget them until the next config
+                        // and use the ordinary connection
+                        warn!(dc_id, error = %e, "media connection failed; using the ordinary one");
+                        self.media_addresses.remove(&dc_id);
+                        match self.find_or_connect(dc_id, false).await {
+                            Ok(index) => index,
+                            Err(e) => {
+                                let _ = tx.send(Err(e));
+                                return ControlFlow::Continue(());
+                            }
                         }
-                    },
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(e));
+                        return ControlFlow::Continue(());
+                    }
                 };
+                let connection = &self.connections[index];
                 let _ = connection.rpc_tx.send(Rpc { body, tx });
                 ControlFlow::Continue(())
             }
@@ -85,6 +98,26 @@ impl SenderPoolRunner {
         }
     }
 
+    /// The DC has media-only addresses and a key to use them with.
+    fn has_media_route(&self, dc_id: i32) -> bool {
+        self.media_addresses
+            .get(&dc_id)
+            .is_some_and(|list| !list.is_empty())
+            && matches!(self.session.dc_option(dc_id), Ok(Some(o)) if o.auth_key.is_some())
+    }
+
+    async fn find_or_connect(&mut self, dc_id: i32, media: bool) -> Result<usize, InvocationError> {
+        if let Some(i) = self
+            .connections
+            .iter()
+            .position(|c| c.dc_id == dc_id && c.media == media)
+        {
+            return Ok(i);
+        }
+        self.create_connection(dc_id, media).await?;
+        Ok(self.connections.len() - 1)
+    }
+
     /// The server invalidated our key (`AUTH_KEY_DUPLICATED`, the key was used from two
     /// connections): forget it and drop the connection, so the next request makes a new key.
     pub(super) async fn forget_auth_key(&mut self, dc_id: i32) {
@@ -106,32 +139,41 @@ impl SenderPoolRunner {
     pub(super) async fn create_connection(
         &mut self,
         dc_id: i32,
+        media: bool,
     ) -> Result<&ConnectionInfo, InvocationError> {
         let mut dc_option = match self.session.dc_option(dc_id)? {
             Some(x) => x,
             None => return Err(InvocationError::InvalidDc),
         };
 
-        let (sender, address) = self.connect_sender(&dc_option).await?;
-        // Remember the address that worked, so the next start tries it first.
-        match address {
-            SocketAddr::V4(a) => dc_option.ipv4 = a,
-            SocketAddr::V6(a) => dc_option.ipv6 = a,
-        }
+        let (sender, address) = if media {
+            self.connect_any(&dc_option, true).await?
+        } else {
+            self.connect_sender(&dc_option).await?
+        };
+        // A media connection uses the stored key and must not replace the primary address.
+        if !media {
+            // Remember the address that worked, so the next start tries it first.
+            match address {
+                SocketAddr::V4(a) => dc_option.ipv4 = a,
+                SocketAddr::V6(a) => dc_option.ipv6 = a,
+            }
 
-        dc_option.auth_key = Some(sender.auth_key());
-        self.session.set_dc_option(&dc_option).await?;
+            dc_option.auth_key = Some(sender.auth_key());
+            self.session.set_dc_option(&dc_option).await?;
+        }
 
         let (rpc_tx, rpc_rx) = mpsc::unbounded_channel();
         let abort_handle = self.connection_pool.spawn(run_sender(
             sender,
             rpc_rx,
             self.updates_tx.clone(),
-            dc_option.id == self.session.home_dc_id()?,
+            !media && dc_option.id == self.session.home_dc_id()?,
             Arc::clone(&self.time_offset),
         ));
         self.connections.push(ConnectionInfo {
             dc_id,
+            media,
             rpc_tx,
             abort_handle,
         });
@@ -151,7 +193,7 @@ impl SenderPoolRunner {
         ),
         InvocationError,
     > {
-        let result = self.connect_any(dc_option).await;
+        let result = self.connect_any(dc_option, false).await;
         // Every known address failed: ask DNS for the fallback config once, then try again.
         // shortcut: once per runner; add a cool-down if blocks come and go while running.
         #[cfg(feature = "doh")]
@@ -171,7 +213,7 @@ impl SenderPoolRunner {
                         datacenters = n,
                         "got addresses from the DNS fallback config"
                     );
-                    return self.connect_any(dc_option).await;
+                    return self.connect_any(dc_option, false).await;
                 }
                 Err(err) => error!(%err, "could not store the DNS fallback addresses"),
             }
@@ -182,6 +224,7 @@ impl SenderPoolRunner {
     async fn connect_any(
         &mut self,
         dc_option: &DcOption,
+        media: bool,
     ) -> Result<
         (
             Sender<Box<dyn transport::Transport + Send>, mtp::Encrypted>,
@@ -195,7 +238,14 @@ impl SenderPoolRunner {
         } else {
             dc_option.ipv4.into()
         };
-        let stored = self.session.dc_addresses(dc_option.id)?;
+        let stored = if media {
+            self.media_addresses
+                .get(&dc_option.id)
+                .cloned()
+                .unwrap_or_default()
+        } else {
+            self.session.dc_addresses(dc_option.id)?
+        };
         let mut last_error = InvocationError::Dropped("no address to connect to");
         let list = match &self.connection_params.mtproxy {
             // the proxy is the only way in: its own addresses replace the datacenter's
@@ -203,12 +253,17 @@ impl SenderPoolRunner {
                 .await
                 .map_err(InvocationError::Io)?
                 .collect(),
+            None if media => stored
+                .iter()
+                .copied()
+                .filter(|a| a.is_ipv6() == use_ipv6)
+                .collect(),
             None => candidates(primary, &stored, use_ipv6),
         };
         for address in list {
             let attempt = tokio::time::timeout(
                 CONNECT_TIMEOUT,
-                self.connect_one(address, dc_option.id, dc_option.auth_key),
+                self.connect_one(address, dc_option.id, media, dc_option.auth_key),
             );
             match attempt.await {
                 Ok(Ok((sender, config))) => {
@@ -232,6 +287,7 @@ impl SenderPoolRunner {
         &self,
         address: SocketAddr,
         dc_id: i32,
+        media: bool,
         auth_key: Option<[u8; 256]>,
     ) -> Result<
         (
@@ -247,12 +303,12 @@ impl SenderPoolRunner {
                 Some(p) if p.padded => Box::new(transport::Obfuscated::with_proxy(
                     transport::PaddedIntermediate::new(),
                     &p.secret,
-                    dc_id as i16,
+                    (if media { -dc_id } else { dc_id }) as i16,
                 )),
                 Some(p) => Box::new(transport::Obfuscated::with_proxy(
                     transport::Intermediate::new(),
                     &p.secret,
-                    dc_id as i16,
+                    (if media { -dc_id } else { dc_id }) as i16,
                 )),
                 None => (params.transport)(),
             }
@@ -313,7 +369,10 @@ impl SenderPoolRunner {
 
         let enums::Config::Config(remote_config) = match sender.invoke(&init_connection).await {
             Ok(config) => config,
-            Err(InvocationError::Transport(transport::Error::BadStatus { status: 404 })) => {
+            // a media connection must keep the stored key: the caller falls back instead
+            Err(InvocationError::Transport(transport::Error::BadStatus { status: 404 }))
+                if !media =>
+            {
                 sender = connect(transport(), addr()).await?;
                 sender.invoke(&init_connection).await?
             }
@@ -323,10 +382,24 @@ impl SenderPoolRunner {
     }
 
     pub(super) async fn update_config(
-        &self,
+        &mut self,
         config: tl::types::Config,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut lists: std::collections::BTreeMap<i32, Vec<SocketAddr>> = Default::default();
+        let mut media: HashMap<i32, Vec<SocketAddr>> = HashMap::new();
+        for option in config
+            .dc_options
+            .iter()
+            .map(|tl::enums::DcOption::Option(option)| option)
+            .filter(|option| option.media_only && !option.cdn && !option.tcpo_only)
+        {
+            if let Some(address) = option_address(option) {
+                let list = media.entry(option.id).or_default();
+                if !list.contains(&address) {
+                    list.push(address);
+                }
+            }
+        }
         for option in config
             .dc_options
             .iter()
@@ -354,6 +427,7 @@ impl SenderPoolRunner {
             }
             self.session.set_dc_option(&dc_option).await?;
         }
+        self.media_addresses = media;
         for (dc_id, list) in lists {
             if self.session.dc_addresses(dc_id)? != list {
                 self.session.set_dc_addresses(dc_id, list).await?;

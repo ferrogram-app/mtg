@@ -7,6 +7,7 @@
 // except according to those terms.
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::num::NonZeroU32;
 use std::ops::{ControlFlow, Deref};
 use std::sync::Arc;
@@ -45,6 +46,8 @@ type InvokeResponse = Vec<u8>;
 enum Request {
     Invoke {
         dc_id: i32,
+        /// Use the media-only addresses of the DC (downloads), if it has any.
+        media: bool,
         body: Vec<u8>,
         tx: oneshot::Sender<Result<InvokeResponse, InvocationError>>,
     },
@@ -68,6 +71,7 @@ struct Rpc {
 
 struct ConnectionInfo {
     dc_id: i32,
+    media: bool,
     rpc_tx: mpsc::UnboundedSender<Rpc>,
     abort_handle: AbortHandle,
 }
@@ -126,6 +130,9 @@ pub struct SenderPoolRunner {
     time_offset: Arc<AtomicI32>,
     /// Consecutive transport `-404` answers per DC (see [`UNKNOWN_KEY_LIMIT`]).
     unknown_key: HashMap<i32, u32>,
+    /// `media_only` addresses per DC from the last `help.getConfig` (RAM only, refilled on every
+    /// connect).
+    media_addresses: HashMap<i32, Vec<SocketAddr>>,
     #[cfg(feature = "doh")]
     dns_fallback_tried: bool,
     connection_pool: JoinSet<Result<(), ReadError>>,
@@ -152,11 +159,32 @@ impl SenderPoolHandle {
             .and_then(|body| R::Return::from_bytes(&body).map_err(|e| e.into()))
     }
 
+    /// Like [`Self::invoke_in_dc`], but over the datacenter's media-only addresses when it has
+    /// any (file transfer); otherwise the ordinary connection is used.
+    pub async fn invoke_media_in_dc<R: tl::RemoteCall>(
+        &self,
+        dc_id: i32,
+        request: &R,
+    ) -> Result<R::Return, InvocationError> {
+        self.do_invoke(dc_id, true, request.to_bytes())
+            .await
+            .and_then(|body| R::Return::from_bytes(&body).map_err(|e| e.into()))
+    }
+
     /// Communicate with the running [`SenderPoolRunner`] instance
     /// to invoke the serialized request body in the specified datacenter.
     pub async fn raw_invoke_in_dc(
         &self,
         dc_id: i32,
+        body: Vec<u8>,
+    ) -> Result<InvokeResponse, InvocationError> {
+        self.raw_invoke(dc_id, false, body).await
+    }
+
+    async fn raw_invoke(
+        &self,
+        dc_id: i32,
+        media: bool,
         body: Vec<u8>,
     ) -> Result<InvokeResponse, InvocationError> {
         if body.len() > MAX_REQUEST_SIZE {
@@ -165,7 +193,12 @@ impl SenderPoolHandle {
 
         let (tx, rx) = oneshot::channel();
         self.0
-            .send(Request::Invoke { dc_id, body, tx })
+            .send(Request::Invoke {
+                dc_id,
+                media,
+                body,
+                tx,
+            })
             .map_err(|_| InvocationError::Dropped("SenderPoolRunner was dropped at send"))?;
         rx.await
             .map_err(|_| InvocationError::Dropped("SenderPoolRunner was dropped during receive"))?
@@ -194,12 +227,21 @@ impl SenderPoolHandle {
         dc_id: i32,
         request_body: Vec<u8>,
     ) -> Result<Vec<u8>, InvocationError> {
+        self.do_invoke(dc_id, false, request_body).await
+    }
+
+    async fn do_invoke(
+        &self,
+        dc_id: i32,
+        media: bool,
+        request_body: Vec<u8>,
+    ) -> Result<Vec<u8>, InvocationError> {
         // 1 is not zero
         let mut fail_count = NonZeroU32::new(1).unwrap();
         let mut slept_so_far = Duration::default();
 
         loop {
-            match self.raw_invoke_in_dc(dc_id, request_body.clone()).await {
+            match self.raw_invoke(dc_id, media, request_body.clone()).await {
                 Ok(response) => break Ok(response),
                 Err(e) => {
                     let error_info = format!("{}", e);
@@ -295,6 +337,7 @@ impl SenderPool {
                 connections: Vec::new(),
                 time_offset: Arc::new(AtomicI32::new(0)),
                 unknown_key: HashMap::new(),
+                media_addresses: HashMap::new(),
                 #[cfg(feature = "doh")]
                 dns_fallback_tried: false,
                 connection_pool: JoinSet::new(),
@@ -372,7 +415,9 @@ fn is_auth_key_duplicated(error: &InvocationError) -> bool {
 impl fmt::Debug for Request {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Invoke { dc_id, body, tx } => f
+            Self::Invoke {
+                dc_id, body, tx, ..
+            } => f
                 .debug_struct("Invoke")
                 .field("dc_id", dc_id)
                 .field(

@@ -295,3 +295,70 @@ async fn fake_tls_with_the_wrong_secret_fails_instead_of_hanging() {
     assert!(server.proxy_dcs().is_empty());
     pool.handle.quit();
 }
+
+fn media_config(port: u16) -> tl::enums::Config {
+    let tl::enums::Config::Config(mut config) = mtg_testkit::config();
+    config.dc_options = vec![tl::enums::DcOption::Option(tl::types::DcOption {
+        ipv6: false,
+        media_only: true,
+        tcpo_only: false,
+        cdn: false,
+        r#static: false,
+        this_port_only: false,
+        id: 2,
+        ip_address: "127.0.0.1".into(),
+        port: port as i32,
+        secret: None,
+    })];
+    tl::enums::Config::Config(config)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn media_requests_use_their_own_connection_once_the_config_lists_media_addresses() {
+    let server = FakeServer::start().await;
+    let port = server.addr.port();
+    server.on(move |_: tl::functions::help::GetConfig| Ok(media_config(port)));
+    server.on(|_: tl::functions::help::GetNearestDc| {
+        Ok(tl::enums::NearestDc::Dc(tl::types::NearestDc {
+            country: "xx".into(),
+            this_dc: 2,
+            nearest_dc: 2,
+        }))
+    });
+    let handle = pool(&server).await;
+    let nearest = tl::functions::help::GetNearestDc {};
+
+    // nothing known yet: the media request goes over the ordinary connection
+    handle.invoke_media_in_dc(2, &nearest).await.unwrap();
+    assert_eq!(server.connections(), 1);
+    // the config of that connection listed a media address: the next request opens one more
+    handle.invoke_media_in_dc(2, &nearest).await.unwrap();
+    assert_eq!(server.connections(), 2);
+    // both kinds are reused
+    handle.invoke_media_in_dc(2, &nearest).await.unwrap();
+    handle.invoke_in_dc(2, &nearest).await.unwrap();
+    assert_eq!(server.connections(), 2);
+    handle.quit();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dead_media_addresses_fall_back_to_the_ordinary_connection() {
+    let server = FakeServer::start().await;
+    // port 1: nothing listens there
+    server.on(|_: tl::functions::help::GetConfig| Ok(media_config(1)));
+    server.on(|_: tl::functions::help::GetNearestDc| {
+        Ok(tl::enums::NearestDc::Dc(tl::types::NearestDc {
+            country: "xx".into(),
+            this_dc: 2,
+            nearest_dc: 2,
+        }))
+    });
+    let handle = pool(&server).await;
+    let nearest = tl::functions::help::GetNearestDc {};
+    handle.invoke_media_in_dc(2, &nearest).await.unwrap();
+    // the media connect fails, the request still succeeds, and the dead address is not retried
+    handle.invoke_media_in_dc(2, &nearest).await.unwrap();
+    handle.invoke_media_in_dc(2, &nearest).await.unwrap();
+    assert_eq!(server.connections(), 1);
+    handle.quit();
+}

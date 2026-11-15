@@ -103,7 +103,7 @@ impl DownloadIter {
             .map_or_else(|| self.client.0.session.home_dc_id(), Ok)?;
 
         loop {
-            break match self.client.invoke_in_dc(dc, &request).await {
+            break match self.client.invoke_media_in_dc(dc, &request).await {
                 Ok(File::File(f)) => {
                     let reached_known_size = self
                         .size
@@ -299,7 +299,7 @@ impl Client {
                         offset,
                         limit: MAX_CHUNK_SIZE,
                     };
-                    match client.invoke_in_dc(task_dc, request).await {
+                    match client.invoke_media_in_dc(task_dc, request).await {
                         Ok(tl::enums::upload::File::File(file)) => {
                             if tx.send((offset as u64, file.bytes)).is_err() {
                                 return Err(InvocationError::Dropped("download receiver closed"));
