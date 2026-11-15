@@ -60,7 +60,7 @@ fn next_updates_deadline() -> Instant {
 
 fn update_sort_key(update: &tl::enums::Update) -> i32 {
     match PtsInfo::from_update(update) {
-        Some(info) => info.pts - info.count,
+        Some(info) => info.pts.wrapping_sub(info.count),
         None => NO_PTS,
     }
 }
@@ -304,7 +304,7 @@ impl MessageBoxes {
         self.reset_deadline(
             key,
             timeout
-                .map(|t| Instant::now() + Duration::from_secs(t as _))
+                .map(|t| Instant::now() + Duration::from_secs(t.max(0) as u64))
                 .unwrap_or_else(next_updates_deadline),
         );
     }
@@ -437,7 +437,7 @@ impl MessageBoxes {
         // > For all the other [not `updates` or `updatesCombined`] `Updates` type constructors
         // > there is no need to check `seq` or change a local state.
         if seq_start != NO_SEQ {
-            match (self.seq + 1).cmp(&seq_start) {
+            match self.seq.wrapping_add(1).cmp(&seq_start) {
                 // Apply
                 Ordering::Equal => {}
                 // Ignore
@@ -515,12 +515,12 @@ impl MessageBoxes {
             self.force_update_entry(
                 LiveEntry {
                     key: info.key,
-                    pts: info.pts - info.count,
+                    pts: info.pts.wrapping_sub(info.count),
                     deadline,
                     possible_gap: None,
                 },
                 |entry| {
-                    match (entry.pts + info.count).cmp(&info.pts) {
+                    match entry.pts.wrapping_add(info.count).cmp(&info.pts) {
                         // Apply
                         Ordering::Equal => {
                             entry.pts = info.pts;
@@ -564,7 +564,7 @@ impl MessageBoxes {
                             let gap_info = PtsInfo::from_update(&gap_update)
                                 .expect("only updates with pts info may be stored as gaps");
 
-                            match (entry.pts + gap_info.count).cmp(&gap_info.pts) {
+                            match entry.pts.wrapping_add(gap_info.count).cmp(&gap_info.pts) {
                                 Ordering::Equal => {
                                     entry.pts = gap_info.pts;
                                     // possible gap can only be resolve if new update closed

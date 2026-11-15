@@ -199,7 +199,11 @@ impl UpdatesReceiver {
                         }
                         continue;
                     }
-                    Err(e) if e.is("CHANNEL_PRIVATE") => {
+                    Err(e)
+                        if e.is("CHANNEL_PRIVATE")
+                            || e.is("CHANNEL_INVALID")
+                            || e.is("CHANNEL_BANNED") =>
+                    {
                         info!(
                             ?request,
                             "Account is now banned so we can no longer fetch updates with request",

@@ -99,8 +99,8 @@ impl MessageBoxes {
                     "handling too-long difference (pts = {}); no longer getting diff",
                     diff.pts
                 );
-                finish = true;
-                // the deadline will be reset once the diff ends
+                // the docs: continue from the new pts, the difference is fetched again
+                finish = false;
                 self.set_pts(Key::Common, diff.pts);
                 (Vec::new(), Vec::new(), Vec::new())
             }

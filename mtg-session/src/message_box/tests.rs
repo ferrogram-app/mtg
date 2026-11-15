@@ -819,3 +819,47 @@ fn channel_difference_calls_out_of_order_are_ignored_not_fatal() {
     );
     assert!(updates.is_empty() && users.is_empty() && chats.is_empty());
 }
+
+#[test]
+fn a_negative_timeout_from_the_server_does_not_overflow_the_clock() {
+    reset_time();
+    advance_time_by(Duration::from_secs(10));
+    let mut message_boxes = MessageBoxes::new();
+    message_boxes.try_set_channel_state(12, 34);
+    message_boxes.reset_timeout(super::Key::Channel(12), Some(i32::MIN));
+    message_boxes.reset_timeout(super::Key::Channel(12), Some(-1));
+}
+
+#[test]
+fn hostile_pts_and_seq_near_the_limits_do_not_overflow() {
+    reset_time();
+    let mut message_boxes = MessageBoxes::new();
+    message_boxes.set_state(state(12, i32::MAX, i32::MAX, 78));
+    // seq + 1 and pts + count wrap instead of panicking
+    let _ = message_boxes.process_updates(updates(13, i32::MIN, i32::MIN));
+    let _ = message_boxes.process_updates(updates(13, 1, i32::MIN + 5));
+    let mut fresh = MessageBoxes::new();
+    let _ = fresh.process_updates(updates(13, 1, i32::MIN));
+}
+
+#[test]
+fn a_too_long_difference_continues_from_its_pts() {
+    reset_time();
+    let mut message_boxes = MessageBoxes::new();
+    message_boxes.set_state(state(56, 78, 12, 34));
+    advance_time_by(NO_UPDATES_TIMEOUT);
+    message_boxes.check_deadlines();
+    assert_eq!(
+        message_boxes.get_difference(),
+        Some(get_difference(56, 12, 34))
+    );
+    message_boxes.apply_difference(tl::types::updates::DifferenceTooLong { pts: 5000 }.into());
+    // still getting the difference, from the new pts
+    assert_eq!(
+        message_boxes.get_difference(),
+        Some(get_difference(56, 5000, 34))
+    );
+    message_boxes
+        .apply_difference(tl::types::updates::DifferenceEmpty { date: 90, seq: 91 }.into());
+    assert_eq!(message_boxes.get_difference(), None);
+}
