@@ -264,3 +264,260 @@ impl fmt::Debug for CallbackQuery {
             .finish()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use mtg_testkit::FakeServer;
+
+    use super::*;
+    use crate::test_util::{client, message, sent, user, user_ref};
+
+    type Log = Arc<Mutex<Vec<String>>>;
+
+    fn state() -> State {
+        State {
+            date: 0,
+            seq: 0,
+            message_box: None,
+        }
+    }
+
+    async fn query(c: &Client, inline: bool, data: Option<Vec<u8>>) -> CallbackQuery {
+        let raw = if inline {
+            tl::types::UpdateInlineBotCallbackQuery {
+                query_id: 7,
+                user_id: 5,
+                msg_id: tl::types::InputBotInlineMessageId {
+                    dc_id: 2,
+                    id: 1,
+                    access_hash: 2,
+                }
+                .into(),
+                chat_instance: 0,
+                data,
+                game_short_name: None,
+            }
+            .into()
+        } else {
+            tl::types::UpdateBotCallbackQuery {
+                query_id: 7,
+                user_id: 5,
+                peer: tl::types::PeerUser { user_id: 5 }.into(),
+                msg_id: 12,
+                chat_instance: 0,
+                data,
+                game_short_name: None,
+            }
+            .into()
+        };
+        CallbackQuery {
+            raw,
+            state: state(),
+            client: c.clone(),
+            peers: c.build_peer_map(vec![user(5)], vec![]).await,
+        }
+    }
+
+    fn answered(server: &FakeServer, log: &Log) {
+        let log = log.clone();
+        server.on(move |req: tl::functions::messages::SetBotCallbackAnswer| {
+            log.lock().unwrap().push(format!(
+                "answer {} {:?} alert={} cache={}",
+                req.query_id, req.message, req.alert, req.cache_time
+            ));
+            Ok(true)
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_button_press_in_a_chat_exposes_its_data() {
+        let server = FakeServer::start().await;
+        let c = client(&server);
+        let q = query(&c, false, Some(vec![1, 2])).await;
+        assert_eq!(q.data(), [1, 2]);
+        assert!(!q.is_from_inline());
+        assert_eq!(q.peer_id(), PeerId::user_unchecked(5));
+        assert_eq!(q.sender_id(), PeerId::user_unchecked(5));
+        assert!(q.peer().is_some() && q.sender().is_some());
+        assert_eq!(q.peer_ref().await.unwrap(), Some(user_ref(5)));
+        assert_eq!(q.sender_ref().await.unwrap(), Some(user_ref(5)));
+        assert!(format!("{q:?}").starts_with("CallbackQuery"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_inline_press_belongs_to_the_user_and_may_have_no_data() {
+        let server = FakeServer::start().await;
+        let c = client(&server);
+        let q = query(&c, true, None).await;
+        assert!(q.is_from_inline() && q.data().is_empty());
+        assert_eq!(q.peer_id(), PeerId::user_unchecked(5));
+        assert_eq!(q.sender_id(), PeerId::user_unchecked(5));
+        let q = query(&c, false, None).await;
+        assert!(q.data().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_pressed_message_is_loaded_or_missing() {
+        let server = FakeServer::start().await;
+        let found = Arc::new(Mutex::new(true));
+        let flag = found.clone();
+        server.on(move |_: tl::functions::messages::GetMessages| {
+            Ok(tl::types::messages::Messages {
+                messages: if *flag.lock().unwrap() {
+                    vec![message(12, user_ref(5), "pressed", 0)]
+                } else {
+                    vec![]
+                },
+                topics: Vec::new(),
+                chats: Vec::new(),
+                users: Vec::new(),
+            }
+            .into())
+        });
+        let c = client(&server);
+        let q = query(&c, false, None).await;
+        assert_eq!(q.load_message().await.unwrap().text(), "pressed");
+        *found.lock().unwrap() = false;
+        assert!(matches!(
+            q.load_message().await,
+            Err(InvocationError::Dropped(_))
+        ));
+        let inline = query(&c, true, None).await;
+        assert!(matches!(
+            inline.load_message().await,
+            Err(InvocationError::Dropped(_))
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn answers_carry_text_alert_and_cache_time() {
+        let server = FakeServer::start().await;
+        let log: Log = Arc::default();
+        answered(&server, &log);
+        let c = client(&server);
+        let q = query(&c, false, None).await;
+        q.answer().send().await.unwrap();
+        q.answer()
+            .text("hi")
+            .cache_time(Duration::from_secs(30))
+            .send()
+            .await
+            .unwrap();
+        q.answer().alert("careful").send().await.unwrap();
+        q.answer()
+            .cache_time(Duration::from_secs(u64::MAX))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            *log.lock().unwrap(),
+            [
+                "answer 7 None alert=false cache=0",
+                "answer 7 Some(\"hi\") alert=false cache=30",
+                "answer 7 Some(\"careful\") alert=true cache=0",
+                "answer 7 None alert=false cache=2147483647",
+            ]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn answering_can_also_edit_respond_or_reply() {
+        let server = FakeServer::start().await;
+        let log: Log = Arc::default();
+        answered(&server, &log);
+        let edits = log.clone();
+        server.on(move |req: tl::functions::messages::EditMessage| {
+            edits
+                .lock()
+                .unwrap()
+                .push(format!("edit {} {:?}", req.id, req.message));
+            Ok(tl::enums::Updates::Updates(tl::types::Updates {
+                updates: Vec::new(),
+                users: Vec::new(),
+                chats: Vec::new(),
+                date: 0,
+                seq: 0,
+            }))
+        });
+        let sends = log.clone();
+        server.on(move |req: tl::functions::messages::SendMessage| {
+            let reply = match &req.reply_to {
+                Some(tl::enums::InputReplyTo::Message(r)) => r.reply_to_msg_id,
+                _ => 0,
+            };
+            sends
+                .lock()
+                .unwrap()
+                .push(format!("send {} reply={reply}", req.message));
+            Ok(sent(
+                req.random_id,
+                message(30, user_ref(5), &req.message, 2),
+            ))
+        });
+        let inline = log.clone();
+        server.on(move |req: tl::functions::messages::EditInlineBotMessage| {
+            inline
+                .lock()
+                .unwrap()
+                .push(format!("inline {:?}", req.message));
+            Ok(true)
+        });
+        let c = client(&server);
+        let q = query(&c, false, None).await;
+        q.answer().edit("new").await.unwrap();
+        assert_eq!(q.answer().respond("r").await.unwrap().id(), 30);
+        assert_eq!(q.answer().reply("p").await.unwrap().id(), 30);
+        let i = query(&c, true, None).await;
+        i.answer().edit("in").await.unwrap();
+        assert!(matches!(
+            i.answer().reply("p").await,
+            Err(InvocationError::Dropped(_))
+        ));
+        assert_eq!(
+            log.lock()
+                .unwrap()
+                .iter()
+                .filter(|l| !l.starts_with("answer"))
+                .collect::<Vec<_>>(),
+            [
+                "edit 12 Some(\"new\")",
+                "send r reply=0",
+                "send p reply=12",
+                "inline Some(\"in\")"
+            ]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn answers_to_unknown_peers_are_dropped_after_the_server_call() {
+        let server = FakeServer::start().await;
+        let log: Log = Arc::default();
+        answered(&server, &log);
+        let c = client(&server);
+        let mut q = query(&c, false, None).await;
+        q.peers = c.empty_peer_map();
+        // user 5 sits in the session cache after the first query: ask about a stranger
+        let tl::enums::Update::BotCallbackQuery(u) = &mut q.raw else {
+            unreachable!()
+        };
+        u.peer = tl::types::PeerUser { user_id: 99 }.into();
+        assert!(matches!(
+            q.answer().edit("x").await,
+            Err(InvocationError::Dropped(_))
+        ));
+        assert!(matches!(
+            q.answer().respond("x").await,
+            Err(InvocationError::Dropped(_))
+        ));
+        assert!(matches!(
+            q.answer().reply("x").await,
+            Err(InvocationError::Dropped(_))
+        ));
+        assert!(matches!(
+            q.load_message().await,
+            Err(InvocationError::Dropped(_))
+        ));
+    }
+}
