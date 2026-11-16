@@ -103,3 +103,115 @@ impl Client {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use mtg_testkit::FakeServer;
+
+    use super::*;
+    use crate::test_util::{channel, channel_ref, chat, client};
+
+    fn joined(chats: Vec<tl::enums::Chat>) -> tl::enums::messages::ChatInviteJoinResult {
+        tl::types::messages::ChatInviteJoinResultOk {
+            updates: tl::enums::Updates::Updates(tl::types::Updates {
+                updates: Vec::new(),
+                users: Vec::new(),
+                chats,
+                date: 0,
+                seq: 0,
+            }),
+        }
+        .into()
+    }
+
+    fn web_view() -> tl::enums::messages::ChatInviteJoinResult {
+        tl::types::messages::ChatInviteJoinResultWebView {
+            bot_id: 1,
+            query_id: 2,
+            users: Vec::new(),
+        }
+        .into()
+    }
+
+    #[cfg(feature = "parse_invite_link")]
+    #[test]
+    fn invite_links_yield_their_hash() {
+        let parse = Client::parse_invite_link;
+        assert_eq!(parse("https://t.me/+abc"), Some("abc".into()));
+        assert_eq!(parse("http://telegram.me/joinchat/xyz"), Some("xyz".into()));
+        assert_eq!(parse("https://t.me/+abc/more"), Some("abc".into()));
+        assert_eq!(parse("https://telesco.pe/+q"), Some("q".into()));
+        // a plain username link, an unknown host, a bad scheme or no link at all
+        assert_eq!(parse("https://t.me/durov"), None);
+        assert_eq!(parse("https://t.me/durov/12"), None);
+        assert_eq!(parse("https://t.me/"), None);
+        assert_eq!(parse("https://example.com/+abc"), None);
+        assert_eq!(parse("ftp://t.me/+abc"), None);
+        assert_eq!(parse("tg:join?invite=abc"), None);
+        assert_eq!(parse("not a url"), None);
+    }
+
+    #[cfg(feature = "parse_invite_link")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn accepting_an_invite_returns_the_joined_chat() {
+        let server = FakeServer::start().await;
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let mode = std::sync::Arc::new(std::sync::Mutex::new(0));
+        let m = mode.clone();
+        server.on(move |req: tl::functions::messages::ImportChatInvite| {
+            log.lock().unwrap().push(req.hash);
+            Ok(match *m.lock().unwrap() {
+                0 => joined(vec![chat(3)]),
+                1 => joined(vec![]),
+                _ => web_view(),
+            })
+        });
+        let c = client(&server);
+        let peer = c
+            .accept_invite_link("https://t.me/+hash1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(peer.id().bare_id(), Some(3));
+        *mode.lock().unwrap() = 1;
+        assert!(
+            c.accept_invite_link("https://t.me/+hash1")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        *mode.lock().unwrap() = 2;
+        assert!(
+            c.accept_invite_link("https://t.me/+hash1")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(*seen.lock().unwrap(), ["hash1"; 3]);
+
+        let bad = c.accept_invite_link("https://example.com/x").await;
+        assert!(matches!(bad, Err(InvocationError::Rpc(e)) if e.name == "INVITE_HASH_INVALID"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn joining_a_channel_returns_that_channel() {
+        let server = FakeServer::start().await;
+        let mode = std::sync::Arc::new(std::sync::Mutex::new(0));
+        let m = mode.clone();
+        server.on(move |_: tl::functions::channels::JoinChannel| {
+            Ok(match *m.lock().unwrap() {
+                0 => joined(vec![channel(10), channel(9)]),
+                1 => joined(vec![channel(10)]),
+                _ => web_view(),
+            })
+        });
+        let c = client(&server);
+        let peer = c.join_chat(channel_ref(9)).await.unwrap().unwrap();
+        assert_eq!(peer.id().bare_id(), Some(9));
+        *mode.lock().unwrap() = 1;
+        assert!(c.join_chat(channel_ref(9)).await.unwrap().is_none());
+        *mode.lock().unwrap() = 2;
+        assert!(c.join_chat(channel_ref(9)).await.unwrap().is_none());
+    }
+}
