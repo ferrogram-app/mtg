@@ -93,3 +93,44 @@ impl<R, T> IterBuffer<R, T> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use mtg_testkit::FakeServer;
+
+    use super::*;
+    use crate::test_util::client;
+
+    async fn buffer(limit: Option<usize>) -> IterBuffer<(), i32> {
+        let server = FakeServer::start().await;
+        let mut b = IterBuffer::from_request(&client(&server), 4, ());
+        b.limit = limit;
+        b.buffer.extend([1, 2, 3]);
+        b
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn items_come_out_in_order_then_the_buffer_is_dry() {
+        let mut b = buffer(None).await;
+        assert_eq!(b.determine_limit(100), 100);
+        assert_eq!(b.next_raw().unwrap().unwrap(), Some(1));
+        assert_eq!(b.pop_item(), Some(2));
+        assert_eq!(b.pop_item(), Some(3));
+        assert!(b.next_raw().is_none()); // empty, more may be fetched
+        b.last_chunk = true;
+        assert_eq!(b.next_raw().unwrap().unwrap(), None);
+        assert_eq!(b.fetched, 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_limit_caps_both_the_items_and_the_request_size() {
+        let mut b = buffer(None).await.limit(2);
+        assert_eq!(b.determine_limit(100), 2);
+        assert_eq!(b.determine_limit(1), 1);
+        b.pop_item();
+        assert_eq!(b.determine_limit(100), 1);
+        b.pop_item();
+        assert_eq!(b.determine_limit(100), 1); // never 0: Telegram would use a default
+        assert_eq!(b.next_raw().unwrap().unwrap(), None);
+    }
+}

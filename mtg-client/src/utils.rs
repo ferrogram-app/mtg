@@ -71,3 +71,60 @@ pub(crate) fn peer_from_message(message: &tl::enums::Message) -> Option<tl::enum
         tl::enums::Message::Service(message) => Some(message.peer_id.clone()),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_util::{message, user_ref};
+
+    #[test]
+    fn random_ids_are_distinct_and_counted() {
+        let ids = generate_random_ids(3);
+        assert_eq!(ids.len(), 3);
+        assert!(ids[0] != ids[1] && ids[1] != ids[2]);
+        assert!(generate_random_ids(0).is_empty());
+    }
+
+    #[test]
+    fn dates_are_unix_seconds() {
+        assert_eq!(date(60).as_second(), 60);
+    }
+
+    #[test]
+    fn password_parameters_exist_only_for_the_known_algorithm() {
+        assert!(extract_password_parameters(&tl::enums::PasswordKdfAlgo::Unknown).is_none());
+        let algo = tl::enums::PasswordKdfAlgo::Sha256Sha256Pbkdf2Hmacsha512iter100000Sha256ModPow(
+            tl::types::PasswordKdfAlgoSha256Sha256Pbkdf2Hmacsha512iter100000Sha256ModPow {
+                salt1: vec![1],
+                salt2: vec![2],
+                p: vec![3],
+                g: 4,
+            },
+        );
+        let (s1, s2, p, g) = extract_password_parameters(&algo).unwrap();
+        assert_eq!(
+            (s1.as_slice(), s2.as_slice(), p.as_slice(), *g),
+            (&[1][..], &[2][..], &[3][..], 4)
+        );
+    }
+
+    #[test]
+    fn the_peer_of_a_message_is_found_for_every_kind() {
+        let peer = user_ref(5);
+        let want = tl::enums::Peer::from(peer.id);
+        assert_eq!(
+            peer_from_message(&message(1, peer, "x", 0)),
+            Some(want.clone())
+        );
+        let empty = tl::enums::Message::Empty(tl::types::MessageEmpty {
+            id: 1,
+            peer_id: Some(want.clone()),
+        });
+        assert_eq!(peer_from_message(&empty), Some(want));
+        let none = tl::enums::Message::Empty(tl::types::MessageEmpty {
+            id: 1,
+            peer_id: None,
+        });
+        assert_eq!(peer_from_message(&none), None);
+    }
+}
