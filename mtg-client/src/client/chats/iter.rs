@@ -330,3 +330,293 @@ impl ProfilePhotoIter {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use mtg_testkit::FakeServer;
+    use mtg_tl_types::{Deserializable, Serializable};
+
+    use super::*;
+    use crate::peer::Role;
+    use crate::test_util::{channel_ref, chat_ref, client, message, user, user_ref};
+
+    fn uid(p: &Participant) -> i64 {
+        p.user.id().bare_id().unwrap()
+    }
+
+    fn full_chat(
+        participants: tl::enums::ChatParticipants,
+        users: Vec<tl::enums::User>,
+    ) -> tl::enums::messages::ChatFull {
+        // chatFull has too many fields to write out: flags, id, about, participants, settings
+        let mut b = 0u32.to_le_bytes().to_vec();
+        b.extend(1i64.to_le_bytes());
+        b.extend(String::new().to_bytes());
+        b.extend(participants.to_bytes());
+        b.extend(0x99622c0cu32.to_le_bytes()); // peerNotifySettings
+        b.extend(0u32.to_le_bytes());
+        let full = tl::types::ChatFull::from_bytes(&b).unwrap();
+        tl::types::messages::ChatFull {
+            full_chat: full.into(),
+            chats: Vec::new(),
+            users,
+        }
+        .into()
+    }
+
+    fn chat_participants(list: Vec<tl::enums::ChatParticipant>) -> tl::enums::ChatParticipants {
+        tl::types::ChatParticipants {
+            chat_id: 1,
+            participants: list,
+            version: 1,
+        }
+        .into()
+    }
+
+    fn plain(id: i64) -> tl::enums::ChatParticipant {
+        tl::types::ChatParticipant {
+            user_id: id,
+            inviter_id: 1,
+            date: 7,
+            rank: None,
+        }
+        .into()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_private_peer_has_no_participants() {
+        let server = FakeServer::start().await;
+        let mut it = client(&server).iter_participants(user_ref(5));
+        assert_eq!(it.total().await.unwrap(), 0);
+        assert!(it.next().await.unwrap().is_none());
+        // the filter only means something for channels
+        let it = client(&server)
+            .iter_participants(user_ref(5))
+            .filter(tl::enums::ChannelParticipantsFilter::ChannelParticipantsBots);
+        assert!(matches!(it.0, ParticipantIterInner::Empty));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_members_of_a_basic_group_come_from_the_full_chat() {
+        let server = FakeServer::start().await;
+        server.on(|req: tl::functions::messages::GetFullChat| {
+            assert_eq!(req.chat_id, 3);
+            let creator = tl::types::ChatParticipantCreator {
+                user_id: 6,
+                rank: None,
+            };
+            // user 99 is not among the users and is skipped
+            Ok(full_chat(
+                chat_participants(vec![plain(5), creator.into(), plain(99)]),
+                vec![user(5), user(6)],
+            ))
+        });
+        let mut it = client(&server).iter_participants(chat_ref(3));
+        assert_eq!(it.total().await.unwrap(), 2);
+        assert_eq!(it.total().await.unwrap(), 2); // cached
+        let first = it.next().await.unwrap().unwrap();
+        assert_eq!(uid(&first), 5);
+        assert!(matches!(first.role, Role::User(_)));
+        let second = it.next().await.unwrap().unwrap();
+        assert!(matches!(second.role, Role::Creator(_)));
+        assert!(it.next().await.unwrap().is_none());
+        assert!(it.next().await.unwrap().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_forbidden_member_list_shows_only_yourself() {
+        let server = FakeServer::start().await;
+        let with_self = Arc::new(Mutex::new(true));
+        let w = with_self.clone();
+        server.on(move |_: tl::functions::messages::GetFullChat| {
+            let me = w.lock().unwrap().then(|| plain(5));
+            Ok(full_chat(
+                tl::types::ChatParticipantsForbidden {
+                    chat_id: 1,
+                    self_participant: me,
+                }
+                .into(),
+                vec![user(5)],
+            ))
+        });
+        let c = client(&server);
+        let mut it = c.iter_participants(chat_ref(3));
+        assert_eq!(uid(&it.next().await.unwrap().unwrap()), 5);
+        assert!(it.next().await.unwrap().is_none());
+
+        *with_self.lock().unwrap() = false;
+        assert!(
+            c.iter_participants(chat_ref(3))
+                .next()
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    fn channel_participants(ids: &[i64]) -> tl::enums::channels::ChannelParticipants {
+        tl::types::channels::ChannelParticipants {
+            count: 42,
+            participants: ids
+                .iter()
+                .map(|&id| {
+                    tl::types::ChannelParticipant {
+                        user_id: id,
+                        date: 1,
+                        subscription_until_date: None,
+                        rank: None,
+                    }
+                    .into()
+                })
+                .collect(),
+            chats: Vec::new(),
+            users: ids.iter().map(|&id| user(id)).collect(),
+        }
+        .into()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn channel_members_are_paged_with_the_filter() {
+        let server = FakeServer::start().await;
+        let offsets = Arc::new(Mutex::new(Vec::new()));
+        let o = offsets.clone();
+        server.on(move |req: tl::functions::channels::GetParticipants| {
+            assert!(matches!(
+                req.filter,
+                tl::enums::ChannelParticipantsFilter::ChannelParticipantsAdmins
+            ));
+            o.lock().unwrap().push((req.offset, req.limit));
+            Ok(channel_participants(&[5, 6]))
+        });
+        let mut it = client(&server)
+            .iter_participants(channel_ref(9))
+            .filter(tl::enums::ChannelParticipantsFilter::ChannelParticipantsAdmins);
+        assert_eq!(it.total().await.unwrap(), 42);
+        assert_eq!(it.total().await.unwrap(), 42); // cached
+        assert_eq!(uid(&it.next().await.unwrap().unwrap()), 5);
+        assert_eq!(uid(&it.next().await.unwrap().unwrap()), 6);
+        // the page was shorter than the limit: that was the last one
+        assert!(it.next().await.unwrap().is_none());
+        assert_eq!(*offsets.lock().unwrap(), [(0, 200)]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_full_page_asks_for_the_next_one() {
+        let server = FakeServer::start().await;
+        let offsets = Arc::new(Mutex::new(Vec::new()));
+        let o = offsets.clone();
+        server.on(move |req: tl::functions::channels::GetParticipants| {
+            o.lock().unwrap().push(req.offset);
+            let n = req.limit as i64;
+            if req.offset == 0 {
+                Ok(channel_participants(&(1..=n).collect::<Vec<_>>()))
+            } else {
+                Ok(channel_participants(&[1000]))
+            }
+        });
+        let mut it = client(&server).iter_participants(channel_ref(9));
+        let mut n = 0;
+        let mut last = 0;
+        while let Some(p) = it.next().await.unwrap() {
+            n += 1;
+            last = uid(&p);
+        }
+        assert_eq!((n, last), (201, 1000));
+        assert_eq!(*offsets.lock().unwrap(), [0, 200]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn not_modified_members_are_an_error() {
+        let server = FakeServer::start().await;
+        server.on(|_: tl::functions::channels::GetParticipants| {
+            Ok(tl::enums::channels::ChannelParticipants::NotModified)
+        });
+        let err = client(&server)
+            .iter_participants(channel_ref(9))
+            .next()
+            .await
+            .unwrap_err();
+        assert!(matches!(err, InvocationError::Dropped(_)));
+    }
+
+    fn photo(id: i64) -> tl::enums::Photo {
+        tl::types::PhotoEmpty { id }.into()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn user_photos_come_from_the_photos_method() {
+        let server = FakeServer::start().await;
+        let slice = Arc::new(Mutex::new(false));
+        let s = slice.clone();
+        server.on(move |_: tl::functions::photos::GetUserPhotos| {
+            Ok(if *s.lock().unwrap() {
+                tl::enums::photos::Photos::from(tl::types::photos::PhotosSlice {
+                    count: 5,
+                    photos: vec![photo(1)],
+                    users: Vec::new(),
+                })
+            } else {
+                tl::types::photos::Photos {
+                    photos: vec![photo(1), photo(2)],
+                    users: Vec::new(),
+                }
+                .into()
+            })
+        });
+        let c = client(&server);
+
+        let mut it = c.iter_profile_photos(user_ref(5));
+        assert_eq!(it.total().await.unwrap(), 2);
+        assert_eq!(it.total().await.unwrap(), 2); // cached
+        assert_eq!(it.next().await.unwrap().unwrap().id(), 1);
+        assert_eq!(it.next().await.unwrap().unwrap().id(), 2);
+        assert!(it.next().await.unwrap().is_none());
+
+        *slice.lock().unwrap() = true;
+        let mut it = c.iter_profile_photos(user_ref(5));
+        assert_eq!(it.total().await.unwrap(), 5);
+    }
+
+    fn edit_photo_service(id: i32, peer: PeerRef, photo_id: i64) -> tl::enums::Message {
+        let mut b = 0u32.to_le_bytes().to_vec();
+        b.extend(id.to_le_bytes());
+        b.extend(tl::enums::Peer::from(peer.id).to_bytes());
+        b.extend(100i32.to_le_bytes());
+        b.extend(
+            tl::enums::MessageAction::from(tl::types::MessageActionChatEditPhoto {
+                photo: photo(photo_id),
+            })
+            .to_bytes(),
+        );
+        tl::enums::Message::Service(tl::types::MessageService::from_bytes(&b).unwrap())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn group_photos_are_found_among_the_service_messages() {
+        let server = FakeServer::start().await;
+        let peer = chat_ref(3);
+        server.on(move |req: tl::functions::messages::Search| {
+            assert!(matches!(
+                req.filter,
+                tl::enums::MessagesFilter::InputMessagesFilterChatPhotos
+            ));
+            Ok(tl::enums::messages::Messages::from(
+                tl::types::messages::Messages {
+                    // a message that is not a photo change is skipped
+                    messages: vec![message(3, peer, "text", 0), edit_photo_service(2, peer, 77)],
+                    topics: Vec::new(),
+                    chats: Vec::new(),
+                    users: Vec::new(),
+                },
+            ))
+        });
+        let mut it = client(&server).iter_profile_photos(peer);
+        assert_eq!(it.next().await.unwrap().unwrap().id(), 77);
+        assert!(it.next().await.unwrap().is_none());
+
+        let mut it = client(&server).iter_profile_photos(peer);
+        assert_eq!(it.total().await.unwrap(), 2);
+    }
+}

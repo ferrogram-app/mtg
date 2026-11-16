@@ -94,7 +94,7 @@ mod tests {
     use mtg_testkit::FakeServer;
 
     use super::*;
-    use crate::test_util::{client, message, sent, user_ref};
+    use crate::test_util::{client, message, user_ref};
 
     async fn stream(server: &FakeServer) -> (UpdateStream, mpsc::Sender<UpdatesLike>) {
         let (tx, rx) = mpsc::channel(8);
