@@ -533,3 +533,121 @@ impl Client {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use mtg_testkit::FakeServer;
+    use mtg_tl_types as tl;
+
+    use crate::test_util::{channel, channel_ref, chat, chat_ref, client, user, user_ref};
+
+    fn chats(chats: Vec<tl::enums::Chat>) -> tl::enums::messages::Chats {
+        tl::types::messages::Chats { chats }.into()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_username_resolves_to_a_peer_or_to_nothing() {
+        let server = FakeServer::start().await;
+        server.on(
+            |req: tl::functions::contacts::ResolveUsername| match req.username.as_str() {
+                "known" => Ok(tl::types::contacts::ResolvedPeer {
+                    peer: tl::types::PeerUser { user_id: 5 }.into(),
+                    users: vec![user(5)],
+                    chats: Vec::new(),
+                }
+                .into()),
+                "gone" => Err((400, "USERNAME_NOT_OCCUPIED".into())),
+                _ => Err((500, "INTERNAL".into())),
+            },
+        );
+        let c = client(&server);
+        assert_eq!(
+            c.resolve_username("known")
+                .await
+                .unwrap()
+                .unwrap()
+                .id()
+                .bare_id_unchecked(),
+            5
+        );
+        assert!(c.resolve_username("gone").await.unwrap().is_none());
+        assert!(c.resolve_username("broken").await.is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_me_wants_exactly_one_user() {
+        let server = FakeServer::start().await;
+        let n = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        server.on(move |_: tl::functions::users::GetUsers| {
+            Ok(match n.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                0 => vec![user(5)],
+                1 => Vec::new(),
+                _ => vec![user(5), user(6)],
+            })
+        });
+        let c = client(&server);
+        assert_eq!(c.get_me().await.unwrap().id().bare_id_unchecked(), 5);
+        assert!(c.get_me().await.is_err());
+        assert!(c.get_me().await.is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn peers_are_resolved_by_kind() {
+        let server = FakeServer::start().await;
+        server.on(|_: tl::functions::users::GetUsers| Ok(vec![user(5)]));
+        server.on(|_: tl::functions::messages::GetChats| Ok(chats(vec![chat(8)])));
+        server.on(|_: tl::functions::channels::GetChannels| Ok(chats(vec![channel(9)])));
+        let c = client(&server);
+        for peer in [user_ref(5), chat_ref(8), channel_ref(9)] {
+            assert_eq!(c.resolve_peer(peer).await.unwrap().id(), peer.id);
+        }
+        // the answer holds a different peer than the one asked for
+        assert!(c.resolve_peer(user_ref(6)).await.is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sliced_chat_lists_are_resolved_too() {
+        let server = FakeServer::start().await;
+        server.on(|_: tl::functions::messages::GetChats| {
+            Ok(tl::types::messages::ChatsSlice {
+                count: 1,
+                chats: vec![chat(8)],
+            }
+            .into())
+        });
+        server.on(|_: tl::functions::channels::GetChannels| {
+            Ok(tl::types::messages::ChatsSlice {
+                count: 1,
+                chats: vec![channel(9)],
+            }
+            .into())
+        });
+        let c = client(&server);
+        assert!(c.resolve_peer(chat_ref(8)).await.is_ok());
+        assert!(c.resolve_peer(channel_ref(9)).await.is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn kicking_depends_on_the_kind_of_chat() {
+        let server = FakeServer::start().await;
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let s = seen.clone();
+        server.on(move |_: tl::functions::channels::EditBanned| {
+            s.lock().unwrap().push("ban");
+            Ok(tl::enums::Updates::TooLong)
+        });
+        let s = seen.clone();
+        server.on(move |_: tl::functions::messages::DeleteChatUser| {
+            s.lock().unwrap().push("delete");
+            Ok(tl::enums::Updates::TooLong)
+        });
+        let c = client(&server);
+        c.kick_participant(channel_ref(9), user_ref(5))
+            .await
+            .unwrap();
+        c.kick_participant(chat_ref(8), user_ref(5)).await.unwrap();
+        c.kick_participant(user_ref(6), user_ref(5)).await.unwrap(); // nothing to kick from
+        // ban with view_messages off for a moment, then lift it
+        assert_eq!(*seen.lock().unwrap(), ["ban", "ban", "delete"]);
+    }
+}

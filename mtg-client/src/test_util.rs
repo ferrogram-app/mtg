@@ -118,3 +118,15 @@ pub(crate) fn channel(id: i64) -> tl::enums::Chat {
     b.extend(0i32.to_le_bytes()); // date
     tl::enums::Chat::Channel(tl::types::Channel::from_bytes(&b).unwrap())
 }
+
+/// A basic group.
+pub(crate) fn chat(id: i64) -> tl::enums::Chat {
+    let mut b = 0u32.to_le_bytes().to_vec();
+    b.extend(id.to_le_bytes());
+    put_string(&mut b, "group");
+    b.extend(0x37c1011cu32.to_le_bytes()); // chatPhotoEmpty
+    for _ in 0..3 {
+        b.extend(0i32.to_le_bytes()); // participants_count, date, version
+    }
+    tl::enums::Chat::Chat(tl::types::Chat::from_bytes(&b).unwrap())
+}
