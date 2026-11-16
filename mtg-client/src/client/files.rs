@@ -563,4 +563,117 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         assert_eq!(bytes, vec![7; 4101]);
     }
+
+    fn flaky(server: &FakeServer, first: (i32, &'static str)) {
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        server.on(move |_: tl::functions::upload::GetFile| {
+            if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                Err((first.0, first.1.to_string()))
+            } else {
+                Ok(file(vec![9; 10]))
+            }
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn skipping_chunks_moves_the_offset() {
+        let server = FakeServer::start().await;
+        let offsets = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = offsets.clone();
+        server.on(move |r: tl::functions::upload::GetFile| {
+            seen.lock().unwrap().push(r.offset);
+            Ok(file(vec![1; 10]))
+        });
+        let client = client(&server);
+        let mut it = client
+            .iter_download(&thing(None))
+            .chunk_size(4096)
+            .skip_chunks(3);
+        it.next().await.unwrap();
+        assert_eq!(*offsets.lock().unwrap(), [3 * 4096]);
+        // a pre-downloaded iterator ignores both
+        let data = Thing {
+            size: None,
+            data: Some(vec![1]),
+            located: true,
+        };
+        let mut it = client.iter_download(&data).chunk_size(4096).skip_chunks(1);
+        assert_eq!(it.next().await.unwrap(), Some(vec![1]));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_file_migrate_error_retries_and_an_unregistered_key_is_exported() {
+        let server = FakeServer::start().await;
+        flaky(&server, (303, "FILE_MIGRATE_2"));
+        let client = client(&server);
+        let mut it = client.iter_download(&thing(None));
+        assert_eq!(it.next().await.unwrap().unwrap().len(), 10);
+
+        let server = FakeServer::start().await;
+        flaky(&server, (401, "AUTH_KEY_UNREGISTERED"));
+        let client = crate::test_util::client(&server);
+        let mut it = client.iter_download(&thing(None));
+        assert_eq!(it.next().await.unwrap().unwrap().len(), 10);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_workers_retry_migrations_and_report_errors() {
+        let size = 2 * MAX_CHUNK_SIZE as usize;
+        let path = std::env::temp_dir().join(format!("mtg-conc-{}.bin", std::process::id()));
+        for first in [(303, "FILE_MIGRATE_2"), (401, "AUTH_KEY_UNREGISTERED")] {
+            let server = FakeServer::start().await;
+            let calls = std::sync::atomic::AtomicUsize::new(0);
+            server.on(move |r: tl::functions::upload::GetFile| {
+                if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    return Err((first.0, first.1.to_string()));
+                }
+                let n = (size - r.offset as usize).min(r.limit as usize);
+                Ok(file(vec![3; n]))
+            });
+            let client = client(&server);
+            client
+                .download_media_concurrent(
+                    thing(Some(size)).to_raw_input_location().unwrap(),
+                    size,
+                    &path,
+                    1,
+                    2,
+                )
+                .await
+                .unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), vec![3; size]);
+        }
+
+        let server = FakeServer::start().await;
+        server.on(|_: tl::functions::upload::GetFile| Err((400, "LOCATION_INVALID".to_string())));
+        let r = client(&server)
+            .download_media_concurrent(
+                thing(Some(size)).to_raw_input_location().unwrap(),
+                size,
+                &path,
+                2,
+                2,
+            )
+            .await;
+        assert!(matches!(r, Err(e) if e.to_string().contains("LOCATION_INVALID")));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_file_over_the_big_threshold_goes_through_the_workers() {
+        let server = FakeServer::start().await;
+        let size = BIG_FILE_SIZE + 1;
+        server.on(move |r: tl::functions::upload::GetFile| {
+            let n = (size - r.offset as usize).min(r.limit as usize);
+            Ok(file(vec![5; n]))
+        });
+        let path = std::env::temp_dir().join(format!("mtg-big-{}.bin", std::process::id()));
+        client(&server)
+            .download_media(&thing(Some(size)), &path)
+            .await
+            .unwrap();
+        let len = std::fs::metadata(&path).unwrap().len();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(len as usize, size);
+    }
 }
