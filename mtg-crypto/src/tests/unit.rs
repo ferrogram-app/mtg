@@ -198,3 +198,9 @@ fn verify_ige_decryption() {
 
     assert_eq!(plaintext.as_slice(), &expected);
 }
+
+#[test]
+fn since_epoch_is_after_2024() {
+    // 2024-01-01; the clock of a machine running the tests is not set before it
+    assert!(since_epoch().as_secs() > 1_704_067_200);
+}

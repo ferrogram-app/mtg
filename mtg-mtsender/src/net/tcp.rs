@@ -53,9 +53,7 @@ impl NetStream {
                 secret,
                 domain,
             } => {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_or(0, |d| d.as_secs() as i32);
+                let now = mtg_crypto::since_epoch().as_secs() as i32;
                 Ok(NetStream::Tls(
                     TlsStream::connect(*address, secret, domain, now).await?,
                 ))

@@ -13,7 +13,9 @@ const SEEN_MSG_IDS: usize = 512;
 
 /// How many `new_session_created` ids are remembered.
 const SEEN_SESSIONS: usize = 16;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
+
+use mtg_crypto::since_epoch;
 
 use mtg_crypto::{AuthKey, decrypt_data_v2, encrypt_data_v2, get_padding_data_v2};
 use mtg_tl_types::{self as tl, Cursor, Deserializable, Identifiable, Serializable};
@@ -144,14 +146,6 @@ pub struct Encrypted {
 
     /// How many containers / gzip wrappers are being unpacked right now.
     nesting: u8,
-}
-
-/// Time since the Unix epoch; a clock set before it reads as zero (`bad_msg_notification` then
-/// corrects the offset) instead of panicking.
-fn since_epoch() -> std::time::Duration {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
 }
 
 /// A random session id. It is not secret; a clock-based value beats aborting.

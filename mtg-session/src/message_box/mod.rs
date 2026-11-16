@@ -561,8 +561,11 @@ impl MessageBoxes {
                     if let Some(mut gap) = entry.possible_gap.take() {
                         gap.updates.sort_by_key(|u| -update_sort_key(u));
                         while let Some(gap_update) = gap.updates.pop() {
-                            let gap_info = PtsInfo::from_update(&gap_update)
-                                .expect("only updates with pts info may be stored as gaps");
+                            // Only updates with pts info are stored as gaps; skip anything else
+                            // instead of trusting that invariant with a panic.
+                            let Some(gap_info) = PtsInfo::from_update(&gap_update) else {
+                                continue;
+                            };
 
                             match entry.pts.wrapping_add(gap_info.count).cmp(&gap_info.pts) {
                                 Ordering::Equal => {

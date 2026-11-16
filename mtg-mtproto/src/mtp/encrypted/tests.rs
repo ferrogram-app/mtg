@@ -233,10 +233,7 @@ fn fresh(n: i64) -> i64 {
 
 /// A server msg_id `secs_ago` seconds in the past.
 fn at(secs_ago: i64, n: i64) -> i64 {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
+    let now = mtg_crypto::since_epoch().as_secs() as i64;
     ((now - secs_ago) << 32) | (4 * n + 1)
 }
 

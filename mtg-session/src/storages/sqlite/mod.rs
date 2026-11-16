@@ -289,48 +289,7 @@ impl Session for SqliteSession {
     }
 
     fn cache_peer(&self, peer: PeerInfo) -> BoxFuture<'_, Result<(), SqliteSessionError>> {
-        Box::pin(async move {
-            let peer = if let Some(mut existing_peer) = self.peer(peer.id()).await? {
-                existing_peer.extend_info(&peer);
-                existing_peer
-            } else {
-                peer
-            };
-
-            let db = self.database.lock().await;
-            let stmt =
-                db.0.prepare("INSERT OR REPLACE INTO peer_info VALUES (:peer_id, :hash, :subtype)")
-                    .await?;
-            let subtype = match peer {
-                PeerInfo::User { bot, is_self, .. } => {
-                    match (bot.unwrap_or_default(), is_self.unwrap_or_default()) {
-                        (true, true) => Some(PeerSubtype::UserSelfBot),
-                        (true, false) => Some(PeerSubtype::UserBot),
-                        (false, true) => Some(PeerSubtype::UserSelf),
-                        (false, false) => None,
-                    }
-                }
-                PeerInfo::Chat { .. } => None,
-                PeerInfo::Channel { kind, .. } => kind.map(|kind| match kind {
-                    ChannelKind::Megagroup => PeerSubtype::Megagroup,
-                    ChannelKind::Broadcast => PeerSubtype::Broadcast,
-                    ChannelKind::Gigagroup => PeerSubtype::Gigagroup,
-                    ChannelKind::Community => PeerSubtype::Community,
-                }),
-            };
-            let mut params = vec![];
-            let peer_id = peer.id().bot_api_dialog_id_unchecked();
-            params.push((":peer_id".to_owned(), peer_id));
-            let hash = peer.auth().unwrap_or_default().hash();
-            if peer.auth().is_some() {
-                params.push((":hash".to_owned(), hash));
-            }
-            if let Some(subtype) = subtype.map(|s| s as i64) {
-                params.push((":subtype".to_owned(), subtype));
-            }
-            stmt.execute(params).await?;
-            Ok(())
-        })
+        self.cache_peers(vec![peer])
     }
 
     fn cache_peers(&self, peers: Vec<PeerInfo>) -> BoxFuture<'_, Result<(), SqliteSessionError>> {

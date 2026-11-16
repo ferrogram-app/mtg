@@ -31,9 +31,7 @@ pub fn parse_answer(body: &str) -> Vec<String> {
 /// Padding that hides the length of the domain from an observer; not secret, so no real RNG.
 // shortcut: clock-derived padding, not random; upgrade only if the length leaks something real.
 pub fn padding() -> String {
-    let n = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.subsec_nanos());
+    let n = mtg_crypto::since_epoch().subsec_nanos();
     "a".repeat(13 + (n % 20) as usize)
 }
 

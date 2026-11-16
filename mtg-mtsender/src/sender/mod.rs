@@ -7,7 +7,7 @@
 // except according to those terms.
 
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 use std::{io, thread};
 
 use mtg_mtproto::transport::Transport;
@@ -48,10 +48,7 @@ pub(crate) fn generate_random_id() -> i64 {
     static LAST_ID: AtomicI64 = AtomicI64::new(0);
 
     while LAST_ID.load(Ordering::SeqCst) == 0 {
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as i64;
+        let now = mtg_crypto::since_epoch().as_nanos() as i64;
 
         if LAST_ID
             .compare_exchange(0, now, Ordering::SeqCst, Ordering::SeqCst)

@@ -21,6 +21,14 @@ mod sha;
 pub use sha::{hmac_sha256, sha1_parts, sha256_parts};
 pub mod two_factor_auth;
 
+/// Time since the Unix epoch. A clock set before it reads as zero instead of panicking: callers
+/// either correct the offset later (`bad_msg_notification`) or only need a non-secret number.
+pub fn since_epoch() -> std::time::Duration {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+}
+
 use std::fmt;
 
 pub use auth_key::AuthKey;

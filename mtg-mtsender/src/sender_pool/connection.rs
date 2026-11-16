@@ -220,9 +220,7 @@ impl SenderPoolRunner {
             self.dns_fallback_tried,
         ) {
             self.dns_fallback_tried = true;
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_secs() as i32);
+            let now = mtg_crypto::since_epoch().as_secs() as i32;
             match crate::fallback::fetch_and_apply(&*self.session, &domain, "", now).await {
                 Ok(0) => warn!("the DNS fallback config gave no addresses"),
                 Ok(n) => {
