@@ -239,3 +239,192 @@ impl Downloadable for ChatPhoto {
         Some(self.raw.clone())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use mtg_tl_types::Deserializable;
+
+    use super::*;
+
+    fn photo() -> Photo {
+        Photo::from_raw(
+            tl::types::Photo {
+                has_stickers: false,
+                id: 5,
+                access_hash: 6,
+                file_reference: vec![],
+                date: 0,
+                sizes: vec![
+                    tl::types::PhotoSize {
+                        r#type: "m".into(),
+                        w: 1,
+                        h: 1,
+                        size: 10,
+                    }
+                    .into(),
+                ],
+                video_sizes: None,
+                dc_id: 4,
+            }
+            .into(),
+        )
+    }
+
+    fn document(sticker: bool) -> tl::types::MessageMediaDocument {
+        let attributes = if sticker {
+            let mut b = 0u32.to_le_bytes().to_vec(); // no flags
+            b.extend([0, 0, 0, 0]); // alt = ""
+            b.extend(4290128789u32.to_le_bytes()); // inputStickerSetEmpty
+            vec![
+                tl::enums::DocumentAttribute::Sticker(
+                    tl::types::DocumentAttributeSticker::from_bytes(&b).unwrap(),
+                ),
+                tl::enums::DocumentAttribute::Animated,
+            ]
+        } else {
+            vec![]
+        };
+        tl::types::MessageMediaDocument {
+            nopremium: false,
+            spoiler: false,
+            video: false,
+            round: false,
+            voice: false,
+            document: Some(
+                tl::types::Document {
+                    id: 8,
+                    access_hash: 9,
+                    file_reference: vec![],
+                    date: 0,
+                    mime_type: "x/y".into(),
+                    size: 55,
+                    thumbs: None,
+                    video_thumbs: None,
+                    dc_id: 3,
+                    attributes,
+                }
+                .into(),
+            ),
+            alt_documents: None,
+            video_cover: None,
+            video_timestamp: None,
+            ttl_seconds: None,
+        }
+    }
+
+    fn webpage() -> tl::types::MessageMediaWebPage {
+        tl::types::MessageMediaWebPage {
+            force_large_media: false,
+            force_small_media: false,
+            manual: false,
+            safe: false,
+            webpage: tl::types::WebPageEmpty { id: 1, url: None }.into(),
+        }
+    }
+
+    fn point() -> tl::enums::GeoPoint {
+        tl::types::GeoPoint {
+            long: 1.0,
+            lat: 2.0,
+            access_hash: 3,
+            accuracy_radius: None,
+        }
+        .into()
+    }
+
+    #[test]
+    fn from_raw_maps_every_supported_media() {
+        use tl::enums::MessageMedia as M;
+
+        let photo_media = M::Photo(photo().raw);
+        assert!(matches!(
+            Media::from_raw(photo_media),
+            Some(Media::Photo(_))
+        ));
+        assert!(matches!(
+            Media::from_raw(M::Document(document(false))),
+            Some(Media::Document(_))
+        ));
+        assert!(matches!(
+            Media::from_raw(M::Document(document(true))),
+            Some(Media::Sticker(s)) if s.animated
+        ));
+        assert!(matches!(
+            Media::from_raw(M::WebPage(webpage())),
+            Some(Media::WebPage(_))
+        ));
+        assert!(matches!(
+            Media::from_raw(M::Geo(tl::types::MessageMediaGeo { geo: point() })),
+            Some(Media::Geo(_))
+        ));
+        assert!(
+            Media::from_raw(M::Geo(tl::types::MessageMediaGeo {
+                geo: tl::types::GeoPointEmpty {}.into()
+            }))
+            .is_none()
+        );
+        assert!(matches!(
+            Media::from_raw(M::Dice(tl::types::MessageMediaDice {
+                value: 1,
+                emoticon: "🎲".into(),
+                game_outcome: None
+            })),
+            Some(Media::Dice(_))
+        ));
+        assert!(Media::from_raw(M::Empty).is_none());
+        assert!(Media::from_raw(M::Unsupported).is_none());
+    }
+
+    #[test]
+    fn size_input_media_location_and_dc_follow_the_kind() {
+        let p = Media::from(photo());
+        assert_eq!(Media::size(&p), Some(10));
+        assert_eq!(Downloadable::size(&p), Some(10));
+        assert!(p.to_raw_input_media().is_some());
+        assert!(p.to_raw_input_location().is_some());
+        assert_eq!(p.dc_id(), Some(4));
+
+        let d = Media::Document(Document::from_raw_media(document(false)));
+        assert_eq!((d.size(), d.dc_id()), (Some(55), Some(3)));
+        assert!(d.to_raw_input_media().is_some() && d.to_raw_input_location().is_some());
+
+        let doc = Document::from_raw_media(document(true));
+        let sticker = Media::Sticker(Sticker::from_document(&doc).unwrap());
+        assert_eq!((sticker.size(), sticker.dc_id()), (Some(55), Some(3)));
+        assert!(
+            sticker.to_raw_input_media().is_some() && sticker.to_raw_input_location().is_some()
+        );
+
+        let web = Media::WebPage(WebPage::from_raw_media(webpage()));
+        assert!(web.to_raw_input_media().is_none());
+        assert!(
+            web.size().is_none() && web.dc_id().is_none() && web.to_raw_input_location().is_none()
+        );
+
+        let others = [
+            Media::Geo(Geo::from_raw_media(tl::types::MessageMediaGeo { geo: point() }).unwrap()),
+            Media::Dice(Dice::from_raw_media(tl::types::MessageMediaDice {
+                value: 1,
+                emoticon: "🎲".into(),
+                game_outcome: None,
+            })),
+        ];
+        for m in others {
+            assert!(
+                m.size().is_none() && m.dc_id().is_none() && m.to_raw_input_location().is_none()
+            );
+            assert!(m.to_raw_input_media().is_some());
+        }
+    }
+
+    #[test]
+    fn chat_photo_downloads_its_location() {
+        let loc = tl::types::InputPeerPhotoFileLocation {
+            big: true,
+            peer: tl::types::InputPeerSelf {}.into(),
+            photo_id: 1,
+        };
+        let p = ChatPhoto { raw: loc.into() };
+        assert_eq!(p.to_raw_input_location(), Some(p.raw.clone()));
+    }
+}
