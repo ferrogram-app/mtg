@@ -8,7 +8,7 @@
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 
-use {DcOption, KNOWN_DC_OPTIONS, PeerInfo, Session, UpdateState};
+use {ChannelKind, DcOption, KNOWN_DC_OPTIONS, PeerAuth, PeerInfo, Session, UpdateState};
 
 use super::*;
 
@@ -201,4 +201,204 @@ async fn dc_addresses_are_ordered_and_persisted() {
     assert!(session.dc_addresses(3).unwrap().is_empty());
     drop(session);
     let _ = std::fs::remove_file(&path);
+}
+
+fn temp_db(name: &str) -> std::path::PathBuf {
+    let path = std::env::temp_dir().join(format!("mtg-{name}-{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    path
+}
+
+#[tokio::test]
+async fn peers_keep_their_subtype_and_are_merged_on_update() {
+    let s = SqliteSession::open(":memory:").await.unwrap();
+    let user = |id, bot, is_self| PeerInfo::User {
+        id,
+        auth: Some(PeerAuth::from_hash(id)),
+        bot: Some(bot),
+        is_self: Some(is_self),
+    };
+    let channel = |id, kind| PeerInfo::Channel {
+        id,
+        auth: Some(PeerAuth::from_hash(id)),
+        kind,
+    };
+    let peers = vec![
+        user(1, false, false),
+        user(2, true, false),
+        user(3, false, true),
+        user(4, true, true),
+        PeerInfo::Chat { id: 5 },
+        channel(6, Some(ChannelKind::Megagroup)),
+        channel(7, Some(ChannelKind::Broadcast)),
+        channel(8, Some(ChannelKind::Gigagroup)),
+        channel(9, Some(ChannelKind::Community)),
+        channel(10, None),
+    ];
+    // the bulk path and the single path must agree
+    s.cache_peers(peers.clone()).await.unwrap();
+    for p in &peers {
+        let got = s.peer(p.id()).await.unwrap().unwrap();
+        match p {
+            // a community is stored but read back without a kind
+            PeerInfo::Channel {
+                kind: Some(ChannelKind::Community),
+                ..
+            } => {
+                assert!(matches!(got, PeerInfo::Channel { kind: None, .. }))
+            }
+            // a user without flags has no subtype stored
+            PeerInfo::User { id: 1, .. } => assert_eq!(
+                got,
+                PeerInfo::User {
+                    id: 1,
+                    auth: Some(PeerAuth::from_hash(1)),
+                    bot: None,
+                    is_self: None
+                }
+            ),
+            _ => assert_eq!(&got, p),
+        }
+    }
+    let single = SqliteSession::open(":memory:").await.unwrap();
+    for p in peers.clone() {
+        single.cache_peer(p).await.unwrap();
+    }
+    for p in &peers {
+        assert_eq!(
+            single.peer(p.id()).await.unwrap(),
+            s.peer(p.id()).await.unwrap()
+        );
+    }
+    assert_eq!(
+        single
+            .peer(PeerId::self_user())
+            .await
+            .unwrap()
+            .unwrap()
+            .id(),
+        PeerId::user_unchecked(3)
+    );
+
+    // known facts are not lost when a later update knows less
+    let weak = PeerInfo::User {
+        id: 2,
+        auth: None,
+        bot: None,
+        is_self: None,
+    };
+    s.cache_peers(vec![weak.clone()]).await.unwrap();
+    single.cache_peer(weak).await.unwrap();
+    for x in [&s, &single] {
+        assert_eq!(
+            x.peer(PeerId::user_unchecked(2)).await.unwrap(),
+            Some(user(2, true, false))
+        );
+    }
+}
+
+#[tokio::test]
+async fn update_state_is_inserted_then_updated() {
+    for first_primary in [true, false] {
+        let s = SqliteSession::open(":memory:").await.unwrap();
+        if first_primary {
+            s.set_update_state(UpdateState::Primary {
+                pts: 1,
+                date: 2,
+                seq: 3,
+            })
+            .await
+            .unwrap();
+            s.set_update_state(UpdateState::Primary {
+                pts: 4,
+                date: 5,
+                seq: 6,
+            })
+            .await
+            .unwrap();
+            s.set_update_state(UpdateState::Secondary { qts: 7 })
+                .await
+                .unwrap();
+        } else {
+            s.set_update_state(UpdateState::Secondary { qts: 7 })
+                .await
+                .unwrap();
+            s.set_update_state(UpdateState::Secondary { qts: 8 })
+                .await
+                .unwrap();
+            s.set_update_state(UpdateState::Primary {
+                pts: 4,
+                date: 5,
+                seq: 6,
+            })
+            .await
+            .unwrap();
+        }
+        let st = s.updates_state().await.unwrap();
+        assert_eq!((st.pts, st.date, st.seq), (4, 5, 6));
+        assert_eq!(st.qts, if first_primary { 7 } else { 8 });
+    }
+}
+
+#[tokio::test]
+async fn bad_rows_in_the_database_are_errors_when_opening() {
+    let path = temp_db("bad-rows");
+    let p = path.to_str().unwrap();
+    let s = SqliteSession::open(p).await.unwrap();
+    {
+        let db = s.database.lock().await;
+        db.0.execute(
+            "INSERT INTO dc_option VALUES (1, '1.2.3.4:443', '[::1]:443', x'0102')",
+            (),
+        )
+        .await
+        .unwrap();
+    }
+    drop(s);
+    let err = SqliteSession::open(p).await.err().unwrap();
+    assert!(matches!(err, SqliteSessionError::InvalidAuthKeyLength(2)));
+    assert_eq!(
+        err.to_string(),
+        "invalid auth_key length: expected 256, got 2"
+    );
+
+    {
+        let conn = libsql::Builder::new_local(p)
+            .build()
+            .await
+            .unwrap()
+            .connect()
+            .unwrap();
+        conn.execute("UPDATE dc_option SET auth_key = NULL", ())
+            .await
+            .unwrap();
+        conn.execute("UPDATE dc_option SET ipv4 = 'nope' WHERE dc_id = 1", ())
+            .await
+            .unwrap();
+    }
+    let err = SqliteSession::open(p).await.err().unwrap();
+    assert!(matches!(err, SqliteSessionError::AddrParse(_)));
+    assert_eq!(err.to_string(), "invalid socket address syntax");
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn a_poisoned_cache_is_an_error_not_a_panic() {
+    let s = std::sync::Arc::new(SqliteSession::open(":memory:").await.unwrap());
+    let t = s.clone();
+    let _ = std::thread::spawn(move || {
+        let _g = t.cache.lock().unwrap();
+        panic!("poison");
+    })
+    .join();
+    assert!(matches!(s.home_dc_id(), Err(SqliteSessionError::Poisoned)));
+    assert!(s.dc_option(1).is_err());
+    assert!(s.dc_addresses(1).is_err());
+    assert!(s.set_home_dc_id(1).await.is_err());
+    assert!(s.set_dc_option(&KNOWN_DC_OPTIONS[0]).await.is_err());
+    assert!(s.set_dc_addresses(1, vec![]).await.is_err());
+    assert_eq!(
+        SqliteSessionError::Poisoned.to_string(),
+        "session lock is poisoned"
+    );
 }
