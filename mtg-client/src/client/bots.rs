@@ -204,3 +204,133 @@ impl Client {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use mtg_testkit::FakeServer;
+    use mtg_tl_types as tl;
+
+    use crate::test_util::{client, user_ref};
+
+    fn result(id: &str, title: Option<&str>) -> tl::enums::BotInlineResult {
+        tl::enums::BotInlineResult::Result(tl::types::BotInlineResult {
+            id: id.into(),
+            r#type: "article".into(),
+            title: title.map(Into::into),
+            description: None,
+            url: None,
+            thumb: None,
+            content: None,
+            send_message: tl::enums::BotInlineMessage::Text(tl::types::BotInlineMessageText {
+                no_webpage: false,
+                invert_media: false,
+                message: "m".into(),
+                entities: None,
+                reply_markup: None,
+            }),
+        })
+    }
+
+    fn media_result(id: &str) -> tl::enums::BotInlineResult {
+        let tl::enums::BotInlineResult::Result(r) = result(id, None) else {
+            unreachable!()
+        };
+        tl::enums::BotInlineResult::BotInlineMediaResult(tl::types::BotInlineMediaResult {
+            id: id.into(),
+            r#type: "photo".into(),
+            photo: None,
+            document: None,
+            title: Some("pic".into()),
+            description: None,
+            send_message: r.send_message,
+        })
+    }
+
+    fn results(
+        next_offset: Option<&str>,
+        results: Vec<tl::enums::BotInlineResult>,
+    ) -> tl::enums::messages::BotResults {
+        tl::types::messages::BotResults {
+            gallery: false,
+            query_id: 42,
+            next_offset: next_offset.map(Into::into),
+            switch_pm: None,
+            switch_webview: None,
+            results,
+            cache_time: 0,
+            users: Vec::new(),
+        }
+        .into()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn inline_results_are_paged_by_the_offset_and_can_be_sent() {
+        let server = FakeServer::start().await;
+        server.on(|req: tl::functions::messages::GetInlineBotResults| {
+            assert_eq!(req.query, "cats");
+            assert!(matches!(req.peer, tl::enums::InputPeer::User(_)));
+            Ok(match req.offset.as_str() {
+                "" => results(Some("next"), vec![result("a", Some("A"))]),
+                "next" => results(None, vec![media_result("b")]),
+                other => panic!("unexpected offset {other}"),
+            })
+        });
+        server.on(|req: tl::functions::messages::SendInlineBotResult| {
+            assert_eq!((req.query_id, req.id.as_str()), (42, "a"));
+            Ok(tl::enums::Updates::TooLong)
+        });
+        let c = client(&server);
+        let mut it = c.inline_query(user_ref(7), "cats").peer(user_ref(5));
+        let first = it.next().await.unwrap().unwrap();
+        assert_eq!(
+            (first.id(), first.title().map(String::as_str)),
+            ("a", Some("A"))
+        );
+        first.send(user_ref(5)).await.unwrap();
+        let second = it.next().await.unwrap().unwrap();
+        assert_eq!(
+            (second.id(), second.title().map(String::as_str)),
+            ("b", Some("pic"))
+        );
+        assert!(it.next().await.unwrap().is_none());
+    }
+
+    fn inline_id() -> tl::enums::InputBotInlineMessageId {
+        tl::types::InputBotInlineMessageId {
+            dc_id: 2,
+            id: 1,
+            access_hash: 2,
+        }
+        .into()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn editing_an_inline_message_goes_to_its_own_dc_for_uploaded_media() {
+        let server = FakeServer::start().await;
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let s = seen.clone();
+        server.on(move |req: tl::functions::messages::EditInlineBotMessage| {
+            s.lock().unwrap().push((req.message, req.media.is_some()));
+            Ok(true)
+        });
+        let c = client(&server);
+        // plain text: the home DC
+        assert!(
+            c.edit_inline_message(inline_id(), "new".into())
+                .await
+                .unwrap()
+        );
+        // external media is also sent from the home DC, without any text
+        let ext = crate::message::InputMessage::new().photo_url("https://example.com/a.jpg");
+        assert!(c.edit_inline_message(inline_id(), ext).await.unwrap());
+        // other media goes to the DC of the message
+        let doc = crate::message::InputMessage::new().media(tl::types::InputMediaGeoPoint {
+            geo_point: tl::enums::InputGeoPoint::Empty,
+        });
+        assert!(c.edit_inline_message(inline_id(), doc).await.unwrap());
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [(Some("new".to_string()), false), (None, true), (None, true)]
+        );
+    }
+}
