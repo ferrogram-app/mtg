@@ -47,9 +47,11 @@ impl Document {
     pub fn id(&self) -> i64 {
         use tl::enums::Document as D;
 
-        match self.raw.document.as_ref().unwrap() {
-            D::Empty(document) => document.id,
-            D::Document(document) => document.id,
+        // media without a document (e.g. one whose time-to-live ran out) has no id
+        match self.raw.document.as_ref() {
+            Some(D::Empty(document)) => document.id,
+            Some(D::Document(document)) => document.id,
+            None => 0,
         }
     }
 
@@ -63,12 +65,12 @@ impl Document {
     pub fn name(&self) -> Option<&str> {
         use tl::enums::Document as D;
 
-        match self.raw.document.as_ref().unwrap() {
-            D::Empty(_) => None,
-            D::Document(document) => document.attributes.iter().find_map(|attr| match attr {
+        match self.raw.document.as_ref() {
+            Some(D::Document(document)) => document.attributes.iter().find_map(|attr| match attr {
                 tl::enums::DocumentAttribute::Filename(attr) => Some(attr.file_name.as_ref()),
                 _ => None,
             }),
+            Some(D::Empty(_)) | None => None,
         }
     }
 
@@ -273,5 +275,190 @@ impl Sticker {
     /// Is this sticker an animated sticker?
     pub fn is_animated(&self) -> bool {
         self.animated
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn doc(attributes: Vec<tl::enums::DocumentAttribute>) -> tl::types::Document {
+        tl::types::Document {
+            id: 5,
+            access_hash: 6,
+            file_reference: vec![1],
+            date: 1_700_000_000,
+            mime_type: "video/mp4".into(),
+            size: 1234,
+            thumbs: Some(vec![
+                tl::types::PhotoSize {
+                    r#type: "m".into(),
+                    w: 1,
+                    h: 2,
+                    size: 3,
+                }
+                .into(),
+            ]),
+            video_thumbs: None,
+            dc_id: 4,
+            attributes,
+        }
+    }
+
+    fn wrap(document: Option<tl::enums::Document>) -> Document {
+        Document::from_raw_media(tl::types::MessageMediaDocument {
+            nopremium: false,
+            spoiler: true,
+            video: false,
+            round: false,
+            voice: false,
+            document,
+            alt_documents: None,
+            video_cover: None,
+            video_timestamp: None,
+            ttl_seconds: Some(9),
+        })
+    }
+
+    fn with(attributes: Vec<tl::enums::DocumentAttribute>) -> Document {
+        wrap(Some(doc(attributes).into()))
+    }
+
+    fn empty() -> Document {
+        wrap(Some(tl::types::DocumentEmpty { id: 8 }.into()))
+    }
+
+    fn video() -> tl::enums::DocumentAttribute {
+        tl::types::DocumentAttributeVideo {
+            round_message: false,
+            supports_streaming: true,
+            nosound: false,
+            duration: 2.5,
+            w: 640,
+            h: 480,
+            preload_prefix_size: None,
+            video_start_ts: None,
+            video_codec: None,
+        }
+        .into()
+    }
+
+    fn audio() -> tl::enums::DocumentAttribute {
+        tl::types::DocumentAttributeAudio {
+            voice: false,
+            duration: 7,
+            title: Some("t".into()),
+            performer: Some("p".into()),
+            waveform: None,
+        }
+        .into()
+    }
+
+    fn sticker_attr() -> tl::enums::DocumentAttribute {
+        tl::types::DocumentAttributeSticker {
+            mask: false,
+            alt: "😀".into(),
+            stickerset: tl::enums::InputStickerSet::Empty,
+            mask_coords: None,
+        }
+        .into()
+    }
+
+    #[test]
+    fn plain_fields() {
+        let d = with(vec![
+            tl::types::DocumentAttributeFilename {
+                file_name: "a.mp4".into(),
+            }
+            .into(),
+        ]);
+        assert_eq!(
+            (d.id(), d.name(), d.mime_type(), d.size()),
+            (5, Some("a.mp4"), Some("video/mp4"), Some(1234))
+        );
+        assert_eq!(d.creation_date().unwrap().as_second(), 1_700_000_000);
+        assert!(d.is_spoiler());
+        assert_eq!(d.thumbs().len(), 1);
+        assert_eq!(Downloadable::size(&d), Some(1234));
+        assert_eq!(d.dc_id(), Some(4));
+        assert!(with(vec![]).name().is_none());
+    }
+
+    #[test]
+    fn an_empty_document_or_none_has_nothing() {
+        for d in [empty(), wrap(None)] {
+            assert!(d.name().is_none() && d.mime_type().is_none() && d.size().is_none());
+            assert!(d.creation_date().is_none() && d.thumbs().is_empty());
+            assert!(d.duration().is_none() && d.resolution().is_none());
+            assert!(d.audio_title().is_none() && d.performer().is_none() && !d.is_animated());
+            assert!(d.to_raw_input_location().is_none() && d.dc_id().is_none());
+            assert!(matches!(
+                d.to_raw_input_document(),
+                tl::enums::InputDocument::Empty
+            ));
+        }
+        assert_eq!(empty().id(), 8);
+        // no document at all must not panic
+        assert_eq!(wrap(None).id(), 0);
+    }
+
+    #[test]
+    fn a_document_without_thumbs_has_none() {
+        let mut raw = doc(vec![]);
+        raw.thumbs = None;
+        assert!(wrap(Some(raw.into())).thumbs().is_empty());
+    }
+
+    #[test]
+    fn duration_and_resolution_come_from_the_first_matching_attribute() {
+        assert_eq!(with(vec![video()]).duration(), Some(2.5));
+        assert_eq!(with(vec![audio()]).duration(), Some(7.0));
+        assert_eq!(with(vec![]).duration(), None);
+        assert_eq!(with(vec![video()]).resolution(), Some((640, 480)));
+        let size = tl::types::DocumentAttributeImageSize { w: 3, h: 4 }.into();
+        assert_eq!(with(vec![size]).resolution(), Some((3, 4)));
+        assert_eq!(with(vec![audio()]).resolution(), None);
+    }
+
+    #[test]
+    fn audio_tags_and_animation() {
+        let d = with(vec![audio()]);
+        assert_eq!((d.audio_title(), d.performer()), (Some("t"), Some("p")));
+        assert!(with(vec![video()]).audio_title().is_none());
+        assert!(with(vec![video()]).performer().is_none());
+        assert!(with(vec![tl::enums::DocumentAttribute::Animated]).is_animated());
+        assert!(!with(vec![video()]).is_animated());
+    }
+
+    #[test]
+    fn input_forms_carry_the_identity() {
+        let d = with(vec![]);
+        let tl::enums::InputDocument::Document(i) = d.to_raw_input_document() else {
+            panic!()
+        };
+        assert_eq!((i.id, i.access_hash, i.file_reference), (5, 6, vec![1]));
+        let m = d.to_raw_input_media();
+        assert_eq!(m.ttl_seconds, Some(9));
+        let Some(tl::enums::InputFileLocation::InputDocumentFileLocation(l)) =
+            d.to_raw_input_location()
+        else {
+            panic!()
+        };
+        assert_eq!((l.id, l.thumb_size.as_str()), (5, ""));
+    }
+
+    #[test]
+    fn stickers_need_a_sticker_attribute() {
+        assert!(Sticker::from_document(&with(vec![])).is_none());
+        assert!(Sticker::from_document(&empty()).is_none());
+        let s = Sticker::from_document(&with(vec![sticker_attr()])).unwrap();
+        assert_eq!(s.emoji(), "😀");
+        assert!(!s.is_animated());
+        let s = Sticker::from_document(&with(vec![
+            sticker_attr(),
+            tl::enums::DocumentAttribute::Animated,
+        ]))
+        .unwrap();
+        assert!(s.is_animated());
     }
 }
