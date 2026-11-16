@@ -264,3 +264,44 @@ fn only_a_fingerprint_we_hold_a_key_for_is_picked() {
     let (fingerprint, _) = pick_key(&[1, -3414540481677951611, -5595554452916591101]).unwrap();
     assert_eq!(fingerprint, -3414540481677951611);
 }
+
+const CDN_PEM: &str = "-----BEGIN RSA PUBLIC KEY-----
+MIIBCgKCAQEA6LszBcC1LGzyr992NzE0ieY+BSaOW622Aa9Bd4ZHLl+TuFQ4lo4g
+5nKaMBwK/BIb9xUfg0Q29/2mgIR6Zr9krM7HjuIcCzFvDtr+L0GQjae9H0pRB2OO
+62cECs5HKhT5DZ98K33vmWiLowc621dQuwKWSQKjWf50XYFw42h21P2KXUGyp2y/
++aEyZ+uVgLLQbRA1dEjSDZ2iGRy12Mk5gpYc397aYp438fsJoHIgJ2lgMv5h7WY9
+t6N/byY9Nw9p21Og3AoXSL2q/2IJ1WRUhebgAdGVMlV1fkuOQoEzR7EdpqtQD9Cs
+5+bfo3Nhmcyvk5ftB0WkJ9z6bNZ7yxrP8wIDAQAB
+-----END RSA PUBLIC KEY-----";
+
+#[test]
+fn a_cdn_dc_is_trusted_only_with_the_keys_from_the_cdn_config() {
+    let key = rsa::Key::from_pem(CDN_PEM).unwrap();
+    let fingerprint = key.fingerprint();
+    let response = |fingerprints: Vec<i64>| {
+        tl::enums::ResPq::Pq(tl::types::ResPq {
+            nonce: [1; 16],
+            server_nonce: [2; 16],
+            pq: 1470626929934143021u64.to_be_bytes().to_vec(),
+            server_public_key_fingerprints: fingerprints,
+        })
+    };
+    // listed by the server and in the config: the request goes out with that fingerprint
+    let (request, _) = step2_with_keys(
+        Step1 { nonce: [1; 16] },
+        response(vec![1, fingerprint]),
+        std::slice::from_ref(&key),
+    )
+    .unwrap();
+    assert_eq!(request.public_key_fingerprint, fingerprint);
+    // a master DC key the server lists is not enough for a CDN DC
+    let r = step2_with_keys(
+        Step1 { nonce: [1; 16] },
+        response(vec![-5595554452916591101]),
+        std::slice::from_ref(&key),
+    );
+    assert!(matches!(r, Err(Error::UnknownFingerprints { .. })));
+    // no keys at all
+    assert!(pick_from(&[fingerprint], &[]).is_err());
+    assert_eq!(pick_from(&[fingerprint], &[key]).unwrap().0, fingerprint);
+}

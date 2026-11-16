@@ -15,6 +15,7 @@ use num_bigint::BigUint;
 use crate::{aes, sha256};
 
 /// RSA key.
+#[derive(Clone)]
 pub struct Key {
     n: BigUint,
     e: BigUint,
@@ -27,6 +28,94 @@ impl Key {
             e: BigUint::parse_bytes(e.as_bytes(), 10)?,
         })
     }
+
+    /// Reads a PEM `RSA PUBLIC KEY` (PKCS#1: `SEQUENCE { INTEGER n, INTEGER e }`), the format of
+    /// the keys in `help.getCdnConfig`. Returns `None` for anything else.
+    pub fn from_pem(pem: &str) -> Option<Self> {
+        let body: String = pem
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with("-----"))
+            .collect();
+        let der = base64_decode(&body)?;
+        let mut der = der.as_slice();
+        let mut sequence = der_item(&mut der, 0x30)?;
+        let n = der_item(&mut sequence, 0x02)?;
+        let e = der_item(&mut sequence, 0x02)?;
+        // trailing bytes mean it is not the plain two-integer sequence
+        if !der.is_empty() || !sequence.is_empty() {
+            return None;
+        }
+        Some(Self {
+            n: BigUint::from_bytes_be(n),
+            e: BigUint::from_bytes_be(e),
+        })
+    }
+
+    /// The fingerprint the server lists in `resPQ`: the low 64 bits (little-endian) of the SHA-1
+    /// of `n` and `e` serialized as TL `bytes`.
+    pub fn fingerprint(&self) -> i64 {
+        let mut data = Vec::new();
+        for part in [&self.n, &self.e] {
+            let bytes = part.to_bytes_be();
+            if bytes.len() < 254 {
+                data.push(bytes.len() as u8);
+            } else {
+                data.push(254);
+                data.extend(&(bytes.len() as u32).to_le_bytes()[..3]);
+            }
+            data.extend(&bytes);
+            while !data.len().is_multiple_of(4) {
+                data.push(0);
+            }
+        }
+        let hash = crate::sha1!(&data);
+        i64::from_le_bytes(hash[12..20].try_into().expect("8 bytes"))
+    }
+}
+
+/// The content of the next DER item with the given tag; `input` moves past it.
+fn der_item<'a>(input: &mut &'a [u8], tag: u8) -> Option<&'a [u8]> {
+    let (&first, rest) = input.split_first()?;
+    if first != tag {
+        return None;
+    }
+    let (&len, rest) = rest.split_first()?;
+    let (len, rest) = match len {
+        0..=0x7f => (len as usize, rest),
+        0x81 => (*rest.first()? as usize, rest.get(1..)?),
+        0x82 => (
+            u16::from_be_bytes(rest.get(..2)?.try_into().ok()?) as usize,
+            rest.get(2..)?,
+        ),
+        _ => return None,
+    };
+    let content = rest.get(..len)?;
+    *input = &rest[len..];
+    Some(content)
+}
+
+fn base64_decode(text: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    let (mut acc, mut bits) = (0u32, 0);
+    for c in text.bytes().take_while(|&c| c != b'=') {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        };
+        acc = acc << 6 | v as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    Some(out)
 }
 
 /// Increment data by 1 when interpreted as a big-endian big int.
@@ -251,5 +340,75 @@ mod tests {
         assert!(decrypt_config_simple(&[0xff; 256], &test_key()).is_none());
         // the real key does not verify a block signed with another one
         assert!(decrypt_config_simple(&good, &config_simple_key()).is_none());
+    }
+
+    // the production key of the official client: its PEM and the fingerprint the servers list
+    const PRODUCTION_PEM: &str = "-----BEGIN RSA PUBLIC KEY-----
+MIIBCgKCAQEA6LszBcC1LGzyr992NzE0ieY+BSaOW622Aa9Bd4ZHLl+TuFQ4lo4g
+5nKaMBwK/BIb9xUfg0Q29/2mgIR6Zr9krM7HjuIcCzFvDtr+L0GQjae9H0pRB2OO
+62cECs5HKhT5DZ98K33vmWiLowc621dQuwKWSQKjWf50XYFw42h21P2KXUGyp2y/
++aEyZ+uVgLLQbRA1dEjSDZ2iGRy12Mk5gpYc397aYp438fsJoHIgJ2lgMv5h7WY9
+t6N/byY9Nw9p21Og3AoXSL2q/2IJ1WRUhebgAdGVMlV1fkuOQoEzR7EdpqtQD9Cs
+5+bfo3Nhmcyvk5ftB0WkJ9z6bNZ7yxrP8wIDAQAB
+-----END RSA PUBLIC KEY-----";
+
+    #[test]
+    fn a_pem_key_has_the_fingerprint_the_server_lists() {
+        let key = Key::from_pem(PRODUCTION_PEM).unwrap();
+        assert_eq!(key.fingerprint(), -3414540481677951611);
+    }
+
+    #[test]
+    fn a_pem_key_is_the_same_as_the_decimal_one() {
+        let pem = Key::from_pem(PRODUCTION_PEM).unwrap();
+        assert_eq!(pem.n, test_key_production().n);
+    }
+
+    fn test_key_production() -> Key {
+        // the production modulus as used for the handshake (see mtproto `key_for_fingerprint`)
+        Key::new("29379598170669337022986177149456128565388431120058863768162556424047512191330847455146576344487764408661701890505066208632169112269581063774293102577308490531282748465986139880977280302242772832972539403531316010870401287642763009136156734339538042419388722777357134487746169093539093850251243897188928735903389451772730245253062963384108812842079887538976360465290946139638691491496062099570836476454855996319192747663615955633778034897140982517446405334423701359108810182097749467210509584293428076654573384828809574217079944388301239431309115013843331317877374435868468779972014486325557807783825502498215169806323", "65537").unwrap()
+    }
+
+    #[test]
+    fn broken_pem_is_rejected() {
+        assert!(Key::from_pem("").is_none());
+        assert!(Key::from_pem("not base64 !!").is_none());
+        // valid base64, not a DER sequence
+        assert!(Key::from_pem("AAAA").is_none());
+        // truncated
+        let cut = &PRODUCTION_PEM[..PRODUCTION_PEM.len() - 60];
+        assert!(Key::from_pem(cut).is_none());
+        // an extra item after the two integers
+        let mut der = base64_decode(
+            &PRODUCTION_PEM
+                .lines()
+                .filter(|l| !l.starts_with("-----"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        der.push(0);
+        assert!(der_item(&mut &der[..], 0x30).is_some());
+        assert!(der_item(&mut &der[..], 0x02).is_none());
+    }
+
+    #[test]
+    fn der_lengths() {
+        assert_eq!(der_item(&mut &[2, 1, 7][..], 2), Some(&[7][..]));
+        assert_eq!(der_item(&mut &[2, 0x81, 1, 7][..], 2), Some(&[7][..]));
+        assert_eq!(der_item(&mut &[2, 0x82, 0, 1, 7][..], 2), Some(&[7][..]));
+        assert!(der_item(&mut &[2, 0x83, 0, 0, 1, 7][..], 2).is_none());
+        assert!(der_item(&mut &[2, 5, 7][..], 2).is_none());
+        assert!(der_item(&mut &[][..], 2).is_none());
+    }
+
+    #[test]
+    fn a_short_modulus_is_serialized_with_a_one_byte_length() {
+        // n = 3, e = 5: each is `len, byte`, padded to 4
+        let key = Key::new("3", "5").unwrap();
+        let expected = crate::sha1!(&[1u8, 3, 0, 0, 1, 5, 0, 0][..]);
+        assert_eq!(
+            key.fingerprint(),
+            i64::from_le_bytes(expected[12..20].try_into().unwrap())
+        );
     }
 }

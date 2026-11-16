@@ -86,3 +86,60 @@ pub fn ige_decrypt(buffer: &mut [u8], key: &[u8; 32], iv: &[u8; 32]) {
         iv2.copy_from_slice(block);
     }
 }
+
+/// AES-256-CTR as used for CDN files (<https://core.telegram.org/cdn>): the counter starts at
+/// `iv` with its last 4 bytes replaced by `offset / 16` (big-endian), so any 16-aligned part of
+/// the file can be decrypted alone. Encryption and decryption are the same operation.
+///
+/// Returns `false`, leaving the buffer alone, if `offset` is not a multiple of 16 or its block
+/// number does not fit 4 bytes.
+pub fn ctr_at_offset(buffer: &mut [u8], key: &[u8; 32], iv: &[u8; 16], offset: u64) -> bool {
+    use aes::cipher::{KeyIvInit, StreamCipher};
+    let Ok(block) = u32::try_from(offset / 16) else {
+        return false;
+    };
+    if !offset.is_multiple_of(16) {
+        return false;
+    }
+    let mut counter = *iv;
+    counter[12..].copy_from_slice(&block.to_be_bytes());
+    ctr::Ctr128BE::<Aes256>::new(key.into(), &counter.into()).apply_keystream(buffer);
+    true
+}
+
+#[cfg(test)]
+mod ctr_tests {
+    use super::*;
+
+    #[test]
+    fn a_part_decrypts_like_the_same_bytes_of_the_whole_stream() {
+        let key = [9u8; 32];
+        let mut iv = [3u8; 16];
+        let mut whole = vec![0u8; 8192];
+        iv[12..].copy_from_slice(&[0; 4]);
+        assert!(ctr_at_offset(&mut whole, &key, &iv, 0));
+        // the keystream of the whole file; the part at 4096 must match its second half
+        let mut part = vec![0u8; 4096];
+        assert!(ctr_at_offset(&mut part, &key, &iv, 4096));
+        assert_eq!(part, whole[4096..]);
+        // the garbage in the last 4 bytes of the given iv does not matter
+        let mut other = iv;
+        other[12..].copy_from_slice(&[0xff; 4]);
+        let mut again = vec![0u8; 4096];
+        assert!(ctr_at_offset(&mut again, &key, &other, 4096));
+        assert_eq!(again, part);
+    }
+
+    #[test]
+    fn bad_offsets_leave_the_buffer_alone() {
+        let mut data = vec![1u8; 32];
+        assert!(!ctr_at_offset(&mut data, &[0; 32], &[0; 16], 8));
+        assert!(!ctr_at_offset(
+            &mut data,
+            &[0; 32],
+            &[0; 16],
+            (u32::MAX as u64 + 1) * 16
+        ));
+        assert_eq!(data, vec![1u8; 32]);
+    }
+}

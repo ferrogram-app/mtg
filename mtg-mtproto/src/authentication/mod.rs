@@ -130,6 +130,24 @@ pub fn step2(
     data: Step1,
     response: tl::enums::ResPq,
 ) -> Result<(tl::functions::ReqDhParams, Step2), Error> {
+    step2_inner(data, response, None)
+}
+
+/// [`step2`] for a CDN DC: only the given keys (from `help.getCdnConfig`, see [`rsa::Key::from_pem`])
+/// are trusted, never the built-in ones of the master DCs. The rest of the exchange is the same.
+pub fn step2_with_keys(
+    data: Step1,
+    response: tl::enums::ResPq,
+    keys: &[rsa::Key],
+) -> Result<(tl::functions::ReqDhParams, Step2), Error> {
+    step2_inner(data, response, Some(keys))
+}
+
+fn step2_inner(
+    data: Step1,
+    response: tl::enums::ResPq,
+    keys: Option<&[rsa::Key]>,
+) -> Result<(tl::functions::ReqDhParams, Step2), Error> {
     if TRACE_AUTH_GEN {
         println!("< {}", hex::to_hex(&response.to_bytes()));
     }
@@ -144,7 +162,7 @@ pub fn step2(
         println!("r {}", hex::to_hex(&random_bytes));
     }
 
-    let res = do_step2(data, response, &random_bytes);
+    let res = do_step2_with(data, response, &random_bytes, keys);
     if TRACE_AUTH_GEN && let Ok((x, _)) = &res {
         println!("> {}", hex::to_hex(&x.to_bytes()));
     }
@@ -178,10 +196,31 @@ fn pick_key(fingerprints: &[i64]) -> Result<(i64, rsa::Key), Error> {
         })
 }
 
+/// The first of `keys` whose fingerprint the server listed.
+fn pick_from(fingerprints: &[i64], keys: &[rsa::Key]) -> Result<(i64, rsa::Key), Error> {
+    keys.iter()
+        .map(|key| (key.fingerprint(), key))
+        .find(|(fingerprint, _)| fingerprints.contains(fingerprint))
+        .map(|(fingerprint, key)| (fingerprint, key.clone()))
+        .ok_or_else(|| Error::UnknownFingerprints {
+            fingerprints: fingerprints.to_vec(),
+        })
+}
+
+#[cfg(test)]
 fn do_step2(
     data: Step1,
     response: tl::enums::ResPq,
     random_bytes: &[u8; 32 + 224],
+) -> Result<(tl::functions::ReqDhParams, Step2), Error> {
+    do_step2_with(data, response, random_bytes, None)
+}
+
+fn do_step2_with(
+    data: Step1,
+    response: tl::enums::ResPq,
+    random_bytes: &[u8; 32 + 224],
+    keys: Option<&[rsa::Key]>,
 ) -> Result<(tl::functions::ReqDhParams, Step2), Error> {
     // Step 2. Validate the PQ response. Return `(p, q)` if it's valid.
     let Step1 { nonce } = data;
@@ -223,7 +262,10 @@ fn do_step2(
     .to_bytes();
 
     // sha_digest + data + random_bytes
-    let (fingerprint, key) = pick_key(&res_pq.server_public_key_fingerprints)?;
+    let (fingerprint, key) = match keys {
+        None => pick_key(&res_pq.server_public_key_fingerprints)?,
+        Some(keys) => pick_from(&res_pq.server_public_key_fingerprints, keys)?,
+    };
     let ciphertext = rsa::encrypt_hashed(&pq_inner_data, &key, &random_bytes);
 
     Ok((
