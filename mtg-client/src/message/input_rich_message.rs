@@ -240,3 +240,92 @@ impl InputRichMessage {
         self
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tl::enums::InputRichMessage as R;
+
+    fn photo() -> tl::enums::InputPhoto {
+        tl::types::InputPhoto {
+            id: 1,
+            access_hash: 2,
+            file_reference: vec![3],
+        }
+        .into()
+    }
+
+    fn document() -> tl::enums::InputDocument {
+        tl::types::InputDocument {
+            id: 1,
+            access_hash: 2,
+            file_reference: vec![3],
+        }
+        .into()
+    }
+
+    #[test]
+    fn the_three_constructors_build_their_variants() {
+        assert!(matches!(
+            InputRichMessage::blocks(vec![]).raw,
+            R::Message(_)
+        ));
+        assert!(
+            matches!(InputRichMessage::html("<b>x</b>").raw, R::Html(h) if h.html == "<b>x</b>")
+        );
+        assert!(
+            matches!(InputRichMessage::markdown("**x**").raw, R::Markdown(m) if m.markdown == "**x**")
+        );
+    }
+
+    #[test]
+    fn rtl_and_noautolink_apply_to_every_variant() {
+        for m in [
+            InputRichMessage::blocks(vec![]),
+            InputRichMessage::html(""),
+            InputRichMessage::markdown(""),
+        ] {
+            let (rtl, auto) = match m.rtl().noautolink().raw {
+                R::Message(r) => (r.rtl, r.noautolink),
+                R::Html(r) => (r.rtl, r.noautolink),
+                R::Markdown(r) => (r.rtl, r.noautolink),
+            };
+            assert!(rtl && auto);
+        }
+    }
+
+    #[test]
+    fn photos_and_documents_go_where_the_variant_keeps_them() {
+        let R::Message(m) = InputRichMessage::blocks(vec![])
+            .photo("", photo())
+            .document("", document())
+            .raw
+        else {
+            panic!()
+        };
+        assert_eq!(
+            (m.photos.map(|p| p.len()), m.documents.map(|d| d.len())),
+            (Some(1), Some(1))
+        );
+
+        let R::Html(h) = InputRichMessage::html("")
+            .photo("p", photo())
+            .document("d", document())
+            .raw
+        else {
+            panic!()
+        };
+        assert!(
+            matches!(h.files.as_deref(), Some([tl::enums::InputRichFile::Photo(p), tl::enums::InputRichFile::Document(d)]) if p.id == "p" && d.id == "d")
+        );
+
+        let R::Markdown(k) = InputRichMessage::markdown("")
+            .photo("p", photo())
+            .document("d", document())
+            .raw
+        else {
+            panic!()
+        };
+        assert_eq!(k.files.map(|f| f.len()), Some(2));
+    }
+}

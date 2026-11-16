@@ -432,3 +432,217 @@ impl From<super::Message> for InputMessage {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use mtg_testkit::FakeServer;
+    use mtg_tl_types::Deserializable;
+
+    use super::*;
+    use crate::message::Message;
+    use crate::test_util::{client, message, user_ref};
+
+    fn file(name: &str) -> Uploaded {
+        Uploaded {
+            raw: tl::types::InputFile {
+                id: 1,
+                parts: 1,
+                name: name.into(),
+                md5_checksum: String::new(),
+            }
+            .into(),
+        }
+    }
+
+    fn doc(m: &InputMessage) -> &tl::types::InputMediaUploadedDocument {
+        let Some(tl::enums::InputMedia::UploadedDocument(d)) = &m.media else {
+            panic!("not an uploaded document")
+        };
+        d
+    }
+
+    #[test]
+    fn plain_flags_and_text_are_stored() {
+        let m = InputMessage::new()
+            .background(true)
+            .clear_draft(true)
+            .invert_media(true)
+            .link_preview(true)
+            .silent(true)
+            .reply_to(Some(7))
+            .text("hi")
+            .fmt_entities([tl::enums::MessageEntity::Bold(
+                tl::types::MessageEntityBold {
+                    offset: 0,
+                    length: 2,
+                },
+            )]);
+        assert!(m.background && m.clear_draft && m.invert_media && m.link_preview && m.silent);
+        assert_eq!(
+            (m.reply_to, m.text.as_str(), m.entities.len()),
+            (Some(7), "hi", 1)
+        );
+        assert_eq!(InputMessage::from("a").text, "a");
+    }
+
+    #[test]
+    fn reply_markup_and_rich_message_are_kept() {
+        let m = InputMessage::new().reply_markup(ReplyMarkup::hide());
+        assert!(matches!(
+            m.reply_markup,
+            Some(tl::enums::ReplyMarkup::ReplyKeyboardHide(_))
+        ));
+        let m = InputMessage::new().rich_message(InputRichMessage::blocks(vec![]));
+        assert!(m.rich_message.is_some());
+    }
+
+    #[test]
+    fn scheduling() {
+        let at = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        assert_eq!(
+            InputMessage::new().schedule_date(Some(at)).schedule_date,
+            Some(1_700_000_000)
+        );
+        assert_eq!(InputMessage::new().schedule_date(None).schedule_date, None);
+        // a time before the epoch cannot be represented
+        let before = UNIX_EPOCH - Duration::from_secs(5);
+        assert_eq!(
+            InputMessage::new()
+                .schedule_date(Some(before))
+                .schedule_date,
+            Some(0)
+        );
+        assert_eq!(
+            InputMessage::new().schedule_once_online().schedule_date,
+            Some(SCHEDULE_ONCE_ONLINE)
+        );
+    }
+
+    #[test]
+    fn photos_carry_the_ttl_only_when_set_before() {
+        let m = InputMessage::new().media_ttl(10).photo(file("a.jpg"));
+        assert!(
+            matches!(m.media, Some(tl::enums::InputMedia::UploadedPhoto(p)) if p.ttl_seconds == Some(10))
+        );
+        let m = InputMessage::new().media_ttl(-1).photo(file("a.jpg"));
+        assert!(
+            matches!(m.media, Some(tl::enums::InputMedia::UploadedPhoto(p)) if p.ttl_seconds.is_none())
+        );
+        let m = InputMessage::new()
+            .media_ttl(3)
+            .photo_url("https://x/a.jpg");
+        assert!(
+            matches!(m.media, Some(tl::enums::InputMedia::PhotoExternal(p)) if p.url == "https://x/a.jpg" && p.ttl_seconds == Some(3))
+        );
+        let m = InputMessage::new()
+            .media_ttl(3)
+            .document_url("https://x/a.bin");
+        assert!(
+            matches!(m.media, Some(tl::enums::InputMedia::DocumentExternal(d)) if d.url == "https://x/a.bin" && d.ttl_seconds == Some(3))
+        );
+    }
+
+    #[test]
+    fn documents_guess_or_override_the_mime_type() {
+        let m = InputMessage::new().document(file("a.png"));
+        assert_eq!(doc(&m).mime_type, "image/png");
+        assert!(!doc(&m).force_file);
+        let m = InputMessage::new().document(file("noext"));
+        assert_eq!(doc(&m).mime_type, "application/octet-stream");
+        let m = InputMessage::new()
+            .mime_type("text/x-custom")
+            .file(file("a.png"));
+        assert_eq!(doc(&m).mime_type, "text/x-custom");
+        assert!(doc(&m).force_file);
+    }
+
+    #[test]
+    fn thumbnail_and_attributes_need_an_uploaded_document() {
+        let m = InputMessage::new()
+            .document(file("a.mp3"))
+            .thumbnail(file("t.png"))
+            .attribute(Attribute::FileName("x".into()));
+        assert!(doc(&m).thumb.is_some());
+        assert!(
+            doc(&m).attributes.iter().any(
+                |a| matches!(a, tl::enums::DocumentAttribute::Filename(f) if f.file_name == "x")
+            )
+        );
+
+        // on anything else both are ignored
+        let m = InputMessage::new()
+            .photo_url("u")
+            .thumbnail(file("t.png"))
+            .attribute(Attribute::FileName("x".into()));
+        assert!(matches!(
+            m.media,
+            Some(tl::enums::InputMedia::PhotoExternal(_))
+        ));
+        let m = InputMessage::new().thumbnail(file("t.png"));
+        assert!(m.media.is_none());
+    }
+
+    #[test]
+    fn raw_media_is_stored_as_is() {
+        let m = InputMessage::new().media(tl::types::InputMediaEmpty {});
+        assert!(matches!(m.media, Some(tl::enums::InputMedia::Empty)));
+    }
+
+    #[test]
+    fn copy_media_of_a_dice_and_of_a_web_page() {
+        let dice = Media::Dice(crate::media::Dice {
+            raw: tl::types::MessageMediaDice {
+                value: 3,
+                emoticon: "🎲".into(),
+                game_outcome: None,
+            },
+        });
+        assert!(matches!(
+            InputMessage::new().copy_media(&dice).media,
+            Some(tl::enums::InputMedia::Dice(_))
+        ));
+    }
+
+    #[cfg(feature = "markdown")]
+    #[test]
+    fn markdown_fills_text_and_entities() {
+        let m = InputMessage::new().markdown("**b**");
+        assert_eq!(m.text, "b");
+        assert_eq!(m.entities.len(), 1);
+    }
+
+    #[cfg(feature = "html")]
+    #[test]
+    fn html_fills_text_and_entities() {
+        let m = InputMessage::new().html("<b>b</b>");
+        assert_eq!(m.text, "b");
+        assert_eq!(m.entities.len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_received_message_becomes_an_input_message() {
+        let server = FakeServer::start().await;
+        let client = client(&server);
+        let peer = user_ref(5);
+        let raw = message(1, peer, "hello", 0);
+        let m = Message::from_raw(&client, raw, Some(peer), client.empty_peer_map().handle());
+        let input = InputMessage::from(m);
+        assert_eq!(input.text, "hello");
+        assert!(input.media.is_none() && input.entities.is_empty());
+
+        // an empty message has no text at all
+        let empty = tl::enums::Message::from_bytes(
+            &[
+                &0x90a6ca84u32.to_le_bytes()[..],
+                &0u32.to_le_bytes(),
+                &9i32.to_le_bytes(),
+            ]
+            .concat(),
+        )
+        .unwrap();
+        let m = Message::from_raw(&client, empty, Some(peer), client.empty_peer_map().handle());
+        assert_eq!(InputMessage::from(m).text, "");
+    }
+}
