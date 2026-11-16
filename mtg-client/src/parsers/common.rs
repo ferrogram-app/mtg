@@ -202,3 +202,42 @@ where
 
     result
 }
+
+/// Entities that neither generator renders: the text must come back unchanged.
+#[cfg(test)]
+pub(crate) fn unrendered_entities() -> Vec<mtg_tl_types::enums::MessageEntity> {
+    use mtg_tl_types::types::*;
+    let (offset, length) = (0, 1);
+    vec![
+        MessageEntityUnknown { offset, length }.into(),
+        MessageEntityMention { offset, length }.into(),
+        MessageEntityHashtag { offset, length }.into(),
+        MessageEntityBotCommand { offset, length }.into(),
+        MessageEntityUrl { offset, length }.into(),
+        MessageEntityEmail { offset, length }.into(),
+        InputMessageEntityMentionName {
+            offset,
+            length,
+            user_id: InputUserSelf {}.into(),
+        }
+        .into(),
+        MessageEntityPhone { offset, length }.into(),
+        MessageEntityCashtag { offset, length }.into(),
+        MessageEntityBankCard { offset, length }.into(),
+        MessageEntityCustomEmoji {
+            offset,
+            length,
+            document_id: 1,
+        }
+        .into(),
+        MessageEntityDiffInsert { offset, length }.into(),
+        MessageEntityDiffReplace {
+            offset,
+            length,
+            old_text: String::new(),
+        }
+        .into(),
+        MessageEntityDiffDelete { offset, length }.into(),
+        MessageEntityTonAddress { offset, length }.into(),
+    ]
+}

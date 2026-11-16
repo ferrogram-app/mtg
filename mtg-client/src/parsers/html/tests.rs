@@ -349,3 +349,93 @@ fn non_numeric_mention_id_is_a_plain_link() {
         ]
     );
 }
+
+#[test]
+fn every_tag_alias_parses_and_unparses() {
+    let (text, entities) = parse_html_message(
+        "<strong>a</strong><em>b</em><del>c</del><s>d</s><u>e</u>\
+         <blockquote>f</blockquote><blockquote expandable>g</blockquote>",
+    );
+    assert_eq!(text, "abcdefg");
+    assert_eq!(entities.len(), 7);
+    assert!(matches!(&entities[6], tl::enums::MessageEntity::Blockquote(q) if q.collapsed));
+    assert!(matches!(&entities[5], tl::enums::MessageEntity::Blockquote(q) if !q.collapsed));
+    assert_eq!(
+        generate_html_message(&text, &entities),
+        "<b>a</b><i>b</i><del>c</del><del>d</del><u>e</u>\
+         <blockquote>f</blockquote><blockquote expandable>g</blockquote>"
+    );
+}
+
+#[test]
+fn generated_dates_carry_their_format() {
+    let date = |f: fn(&mut tl::types::MessageEntityFormattedDate)| {
+        let mut e = tl::types::MessageEntityFormattedDate {
+            offset: 0,
+            length: 1,
+            date: 0,
+            relative: false,
+            short_time: false,
+            long_time: false,
+            short_date: false,
+            long_date: false,
+            day_of_week: false,
+        };
+        f(&mut e);
+        generate_html_message("x", &[e.into()])
+    };
+    let head = "<time datetime=\"1970-01-01T00:00:00Z\"";
+    assert_eq!(date(|_| {}), format!("{head}>x</time>"));
+    assert_eq!(
+        date(|e| e.relative = true),
+        format!("{head} data-format=\"r\">x</time>")
+    );
+    assert_eq!(
+        date(|e| {
+            e.day_of_week = true;
+            e.short_date = true;
+            e.short_time = true;
+        }),
+        format!("{head} data-format=\"wdt\">x</time>")
+    );
+    assert_eq!(
+        date(|e| {
+            e.long_date = true;
+            e.long_time = true;
+        }),
+        format!("{head} data-format=\"DT\">x</time>")
+    );
+}
+
+#[test]
+fn time_formats_reset_each_other() {
+    let parse = |attrs: &str| {
+        let (_, e) = parse_html_message(&format!(
+            "<time datetime=\"2026-09-27 12:13:14\"{attrs}>t</time>"
+        ));
+        match e.into_iter().next() {
+            Some(tl::enums::MessageEntity::FormattedDate(d)) => d,
+            other => panic!("not a date: {other:?}"),
+        }
+    };
+    // no zone: read as UTC
+    assert_eq!(parse("").date, 1_790_511_194);
+    let d = parse(" data-format=\"dwtr\"");
+    assert!(d.relative && !d.short_date && !d.day_of_week && !d.short_time);
+    let d = parse(" data-format=\"rdDtTw?\"");
+    assert!(!d.relative && d.long_date && !d.short_date && d.long_time && !d.short_time);
+    assert!(d.day_of_week);
+    let d = parse(" data-format=\"Dd\"");
+    assert!(d.short_date && !d.long_date);
+    let d = parse(" data-format=\"tT\"");
+    assert!(d.long_time && !d.short_time);
+    // a tag without datetime gives no entity
+    let (text, entities) = parse_html_message("<time>t</time>");
+    assert_eq!((text.as_str(), entities.len()), ("t", 0));
+}
+
+#[test]
+fn unrendered_entities_leave_the_html_alone() {
+    let entities = crate::parsers::common::unrendered_entities();
+    assert_eq!(generate_html_message("x", &entities), "x");
+}

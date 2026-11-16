@@ -409,4 +409,54 @@ mod tests {
         let generated = generate_markdown_message(&text, &entities);
         assert_eq!(generated, markdown);
     }
+
+    #[test]
+    fn unrendered_entities_leave_the_markdown_alone() {
+        use tl::types::*;
+        let mut entities = crate::parsers::common::unrendered_entities();
+        entities.push(
+            MessageEntityUnderline {
+                offset: 0,
+                length: 1,
+            }
+            .into(),
+        );
+        entities.push(
+            MessageEntityStrike {
+                offset: 0,
+                length: 1,
+            }
+            .into(),
+        );
+        entities.push(
+            MessageEntityBlockquote {
+                collapsed: false,
+                offset: 0,
+                length: 1,
+            }
+            .into(),
+        );
+        entities.push(
+            MessageEntitySpoiler {
+                offset: 0,
+                length: 1,
+            }
+            .into(),
+        );
+        entities.push(
+            MessageEntityFormattedDate {
+                offset: 0,
+                length: 1,
+                date: 0,
+                relative: false,
+                short_time: false,
+                long_time: false,
+                short_date: false,
+                long_date: false,
+                day_of_week: false,
+            }
+            .into(),
+        );
+        assert_eq!(generate_markdown_message("x", &entities), "x");
+    }
 }
