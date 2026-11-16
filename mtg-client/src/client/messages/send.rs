@@ -419,3 +419,139 @@ impl Client {
         Ok(map_random_ids_to_messages(self, peer, &request.random_id, result).await?)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use mtg_testkit::FakeServer;
+    use mtg_tl_types as tl;
+
+    use crate::test_util::{channel_ref, client, message, sent, user_ref};
+
+    fn affected(pts_count: i32) -> tl::enums::messages::AffectedMessages {
+        tl::types::messages::AffectedMessages { pts: 1, pts_count }.into()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_sent_text_message_is_found_by_its_random_id() {
+        let server = FakeServer::start().await;
+        let peer = user_ref(5);
+        server.on(move |req: tl::functions::messages::SendMessage| {
+            assert_eq!(req.message, "hi");
+            Ok(sent(req.random_id, message(7, peer, "hi", 2)))
+        });
+        let sent = client(&server).send_message(peer, "hi").await.unwrap();
+        assert_eq!((sent.id(), sent.text()), (7, "hi"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn media_goes_through_send_media() {
+        let server = FakeServer::start().await;
+        let peer = user_ref(5);
+        server.on(move |req: tl::functions::messages::SendMedia| {
+            assert_eq!(req.message, "cap");
+            Ok(sent(req.random_id, message(8, peer, "cap", 2)))
+        });
+        let input = crate::message::InputMessage::new()
+            .text("cap")
+            .photo_url("https://example.com/a.jpg");
+        let sent = client(&server).send_message(peer, input).await.unwrap();
+        assert_eq!(sent.id(), 8);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_answer_without_our_message_gives_an_empty_one() {
+        let server = FakeServer::start().await;
+        server.on(|_: tl::functions::messages::SendMessage| {
+            Ok(tl::enums::Updates::Updates(tl::types::Updates {
+                updates: Vec::new(),
+                users: Vec::new(),
+                chats: Vec::new(),
+                date: 0,
+                seq: 0,
+            }))
+        });
+        let sent = client(&server)
+            .send_message(user_ref(5), "hi")
+            .await
+            .unwrap();
+        assert_eq!(sent.id(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_short_sent_message_is_built_from_the_input() {
+        let server = FakeServer::start().await;
+        server.on(|_: tl::functions::messages::SendMessage| {
+            Ok(tl::enums::Updates::UpdateShortSentMessage(
+                tl::types::UpdateShortSentMessage {
+                    out: true,
+                    id: 11,
+                    pts: 1,
+                    pts_count: 1,
+                    date: 50,
+                    media: None,
+                    entities: None,
+                    ttl_period: None,
+                },
+            ))
+        });
+        let sent = client(&server)
+            .send_message(user_ref(5), "yo")
+            .await
+            .unwrap();
+        assert_eq!((sent.id(), sent.text()), (11, "yo"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn editing_sends_text_or_nothing_when_empty() {
+        let server = FakeServer::start().await;
+        let texts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = texts.clone();
+        server.on(move |req: tl::functions::messages::EditMessage| {
+            seen.lock().unwrap().push((req.id, req.message));
+            Ok(tl::enums::Updates::Combined(tl::types::UpdatesCombined {
+                updates: Vec::new(),
+                users: Vec::new(),
+                chats: Vec::new(),
+                date: 0,
+                seq_start: 0,
+                seq: 0,
+            }))
+        });
+        let c = client(&server);
+        c.edit_message(user_ref(5), 3, "new").await.unwrap();
+        c.edit_message(user_ref(5), 4, "").await.unwrap();
+        assert_eq!(
+            *texts.lock().unwrap(),
+            vec![(3, Some("new".to_string())), (4, None)]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn deleting_picks_the_channel_or_the_common_call() {
+        let server = FakeServer::start().await;
+        server.on(|req: tl::functions::channels::DeleteMessages| Ok(affected(req.id.len() as i32)));
+        server.on(|req: tl::functions::messages::DeleteMessages| {
+            assert!(req.revoke);
+            Ok(affected(10 + req.id.len() as i32))
+        });
+        let c = client(&server);
+        assert_eq!(c.delete_messages(channel_ref(9), &[1, 2]).await.unwrap(), 2);
+        assert_eq!(c.delete_messages(user_ref(5), &[1]).await.unwrap(), 11);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn forwarding_maps_each_random_id_to_its_message() {
+        let server = FakeServer::start().await;
+        let dest = user_ref(6);
+        server.on(move |req: tl::functions::messages::ForwardMessages| {
+            assert_eq!(req.id, vec![1]);
+            Ok(sent(req.random_id[0], message(21, dest, "fwd", 2)))
+        });
+        let got = client(&server)
+            .forward_messages(dest, &[1], user_ref(5))
+            .await
+            .unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].as_ref().unwrap().id(), 21);
+    }
+}

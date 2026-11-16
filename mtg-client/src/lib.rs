@@ -108,6 +108,8 @@ pub mod message;
 #[cfg(any(feature = "markdown", feature = "html"))]
 pub mod parsers;
 pub mod peer;
+#[cfg(test)]
+pub(crate) mod test_util;
 pub mod update;
 pub(crate) mod utils;
 
