@@ -120,3 +120,20 @@ fn empty() -> DcOption {
         auth_key: None,
     }
 }
+
+#[test]
+fn debug_of_a_request_survives_a_body_shorter_than_a_constructor_id() {
+    for body in [vec![], vec![1, 2, 3]] {
+        let (tx, _rx) = oneshot::channel();
+        let text = format!(
+            "{:?}",
+            Request::Invoke {
+                dc_id: 2,
+                media: false,
+                body,
+                tx
+            }
+        );
+        assert!(text.contains("\"?\""), "{text}");
+    }
+}

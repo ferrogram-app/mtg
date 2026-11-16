@@ -447,9 +447,9 @@ impl fmt::Debug for Request {
                 .field("dc_id", dc_id)
                 .field(
                     "request",
-                    &body[..4]
-                        .try_into()
-                        .map(|constructor_id| tl::name_for_id(u32::from_le_bytes(constructor_id)))
+                    &body
+                        .first_chunk::<4>()
+                        .map(|id| tl::name_for_id(u32::from_le_bytes(*id)))
                         .unwrap_or("?"),
                 )
                 .field("tx", tx)
