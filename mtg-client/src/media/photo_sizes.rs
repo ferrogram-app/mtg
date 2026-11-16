@@ -396,3 +396,197 @@ viewBox="0 0 512 512" xml:space="preserve">
         res.as_bytes().to_vec()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ty(t: &str) -> String {
+        t.to_string()
+    }
+
+    fn photo() -> tl::types::Photo {
+        tl::types::Photo {
+            has_stickers: false,
+            id: 11,
+            access_hash: 22,
+            file_reference: vec![1, 2, 3, 4],
+            date: 0,
+            sizes: Vec::new(),
+            video_sizes: None,
+            dc_id: 7,
+        }
+    }
+
+    fn document() -> tl::types::Document {
+        tl::types::Document {
+            id: 33,
+            access_hash: 44,
+            file_reference: vec![9],
+            date: 0,
+            mime_type: String::new(),
+            size: 0,
+            thumbs: None,
+            video_thumbs: None,
+            dc_id: 2,
+            attributes: Vec::new(),
+        }
+    }
+
+    fn raw_sizes() -> Vec<tl::enums::PhotoSize> {
+        vec![
+            tl::types::PhotoSizeEmpty { r#type: ty("e") }.into(),
+            tl::types::PhotoSize {
+                r#type: ty("m"),
+                w: 10,
+                h: 20,
+                size: 300,
+            }
+            .into(),
+            tl::types::PhotoCachedSize {
+                r#type: ty("c"),
+                w: 1,
+                h: 2,
+                bytes: vec![1, 2, 3],
+            }
+            .into(),
+            tl::types::PhotoStrippedSize {
+                r#type: ty("i"),
+                bytes: vec![1, 40, 50, 9, 9],
+            }
+            .into(),
+            tl::types::PhotoSizeProgressive {
+                r#type: ty("p"),
+                w: 5,
+                h: 6,
+                sizes: vec![10, 90, 40],
+            }
+            .into(),
+            tl::types::PhotoPathSize {
+                r#type: ty("j"),
+                bytes: vec![48, 112, 176, 192],
+            }
+            .into(),
+        ]
+    }
+
+    #[test]
+    fn sizes_of_a_photo_keep_their_kind_and_type() {
+        let p = photo();
+        let sizes: Vec<_> = raw_sizes()
+            .iter()
+            .map(|s| PhotoSize::make_from(s, &p))
+            .collect();
+        assert!(matches!(sizes[0], PhotoSize::Empty(_)));
+        assert!(
+            matches!(&sizes[1], PhotoSize::Size(s) if (s.width, s.height, s.size) == (10, 20, 300))
+        );
+        assert!(matches!(sizes[2], PhotoSize::Cached(_)));
+        assert!(matches!(sizes[3], PhotoSize::Stripped(_)));
+        assert!(matches!(&sizes[4], PhotoSize::Progressive(s) if s.sizes == [10, 90, 40]));
+        assert!(matches!(sizes[5], PhotoSize::Path(_)));
+        let types: Vec<_> = sizes.iter().map(|s| s.photo_type()).collect();
+        assert_eq!(types, ["e", "m", "c", "i", "p", "j"]);
+    }
+
+    #[test]
+    fn byte_sizes_are_estimated() {
+        let p = photo();
+        let sizes: Vec<_> = raw_sizes()
+            .iter()
+            .map(|s| PhotoSize::make_from(s, &p))
+            .collect();
+        let n: Vec<_> = sizes.iter().map(|s| s.size()).collect();
+        // empty, plain, cached bytes, stripped (len + 622), progressive max, path bytes
+        assert_eq!(n, [0, 300, 3, 5 + 622, 90, 4]);
+
+        let short = PhotoSize::Stripped(StrippedSize {
+            photo_type: ty("i"),
+            bytes: vec![1, 2],
+        });
+        let wrong = PhotoSize::Stripped(StrippedSize {
+            photo_type: ty("i"),
+            bytes: vec![2, 2, 2],
+        });
+        let none = PhotoSize::Progressive(ProgressiveSize {
+            photo_type: ty("p"),
+            width: 0,
+            height: 0,
+            sizes: vec![],
+            id: 0,
+            access_hash: 0,
+            file_reference: vec![],
+            from_document: false,
+        });
+        assert_eq!((short.size(), wrong.size(), none.size()), (0, 0, 0));
+    }
+
+    #[test]
+    fn only_remote_sizes_have_a_location() {
+        let p = photo();
+        let sizes: Vec<_> = raw_sizes()
+            .iter()
+            .map(|s| PhotoSize::make_from(s, &p))
+            .collect();
+        let has: Vec<_> = sizes
+            .iter()
+            .map(|s| s.to_raw_input_location().is_some())
+            .collect();
+        assert_eq!(has, [false, true, false, false, true, false]);
+        let Some(tl::enums::InputFileLocation::InputPhotoFileLocation(l)) =
+            sizes[1].to_raw_input_location()
+        else {
+            panic!()
+        };
+        assert_eq!((l.id, l.access_hash, l.thumb_size.as_str()), (11, 22, "m"));
+        assert_eq!(l.file_reference, [1, 2, 3, 4]);
+
+        let d = document();
+        let sizes: Vec<_> = raw_sizes()
+            .iter()
+            .map(|s| PhotoSize::make_from_document(s, &d))
+            .collect();
+        let Some(tl::enums::InputFileLocation::InputDocumentFileLocation(l)) =
+            sizes[4].to_raw_input_location()
+        else {
+            panic!()
+        };
+        assert_eq!((l.id, l.access_hash, l.thumb_size.as_str()), (33, 44, "p"));
+        // the other kinds are built the same way from a document
+        assert!(matches!(sizes[0], PhotoSize::Empty(_)));
+        assert!(matches!(&sizes[1], PhotoSize::Size(s) if s.size == 300));
+        assert!(matches!(sizes[2], PhotoSize::Cached(_)));
+        assert!(matches!(sizes[3], PhotoSize::Stripped(_)));
+        assert!(matches!(sizes[5], PhotoSize::Path(_)));
+        assert!(sizes[1].to_raw_input_location().is_some());
+    }
+
+    #[test]
+    fn inline_data_is_rebuilt_for_small_sizes() {
+        let p = photo();
+        let sizes: Vec<_> = raw_sizes()
+            .iter()
+            .map(|s| PhotoSize::make_from(s, &p))
+            .collect();
+        assert_eq!(sizes[0].to_data(), None);
+        assert_eq!(sizes[1].to_data(), None);
+        assert_eq!(sizes[2].to_data(), Some(vec![1, 2, 3]));
+        assert_eq!(sizes[4].to_data(), None);
+
+        // a stripped jpeg gets its header with the real height and width, and a footer
+        let jpeg = sizes[3].to_data().unwrap();
+        assert_eq!(&jpeg[..2], [0xff, 0xd8]);
+        assert_eq!(&jpeg[jpeg.len() - 2..], [0xff, 0xd9]);
+        assert_eq!((jpeg[164], jpeg[166]), (40, 50));
+        assert!(jpeg.windows(2).any(|w| w == [9, 9]));
+        let broken = PhotoSize::Stripped(StrippedSize {
+            photo_type: ty("i"),
+            bytes: vec![1, 2],
+        });
+        assert_eq!(broken.to_data(), Some(vec![]));
+
+        // a path size becomes an svg: 48 -> "0", 112 -> "-0", 176 -> ",0", 192 -> lookup[0]
+        let svg = String::from_utf8(sizes[5].to_data().unwrap()).unwrap();
+        assert!(svg.contains(r#"<path d="M0-0,0Az"/>"#), "{svg}");
+    }
+}
