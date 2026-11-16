@@ -44,3 +44,50 @@ impl MessageDeletion {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state() -> State {
+        State {
+            date: 0,
+            seq: 0,
+            message_box: None,
+        }
+    }
+
+    #[test]
+    fn private_and_channel_deletions() {
+        let private = MessageDeletion {
+            raw: tl::types::UpdateDeleteMessages {
+                messages: vec![1, 2],
+                pts: 1,
+                pts_count: 2,
+            }
+            .into(),
+            state: state(),
+        };
+        assert_eq!(
+            (private.channel_id(), private.messages()),
+            (None, &[1, 2][..])
+        );
+        assert_eq!(private.into_messages(), [1, 2]);
+
+        let channel = MessageDeletion {
+            raw: tl::types::UpdateDeleteChannelMessages {
+                channel_id: 9,
+                messages: vec![5],
+                pts: 1,
+                pts_count: 1,
+            }
+            .into(),
+            state: state(),
+        };
+        assert_eq!(
+            (channel.channel_id(), channel.messages()),
+            (Some(9), &[5][..])
+        );
+        assert_eq!(channel.into_messages(), [5]);
+    }
+}

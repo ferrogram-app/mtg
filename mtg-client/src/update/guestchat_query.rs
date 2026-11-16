@@ -64,3 +64,63 @@ impl AnsweredMessage {
             .await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use mtg_testkit::FakeServer;
+
+    use super::*;
+    use crate::message::InputMessage;
+    use crate::test_util::{client, message, user_ref};
+    use crate::update::inline_query::Article;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn answering_gives_a_message_that_can_be_edited() {
+        let server = FakeServer::start().await;
+        server.on(|req: tl::functions::messages::SetBotGuestChatResult| {
+            assert_eq!(req.query_id, 4);
+            Ok(tl::enums::InputBotInlineMessageId::from(
+                tl::types::InputBotInlineMessageId {
+                    dc_id: 2,
+                    id: 1,
+                    access_hash: 2,
+                },
+            ))
+        });
+        server.on(|req: tl::functions::messages::EditInlineBotMessage| {
+            assert_eq!(req.message.as_deref(), Some("later"));
+            Ok(true)
+        });
+        let c = client(&server);
+        let msg = crate::message::Message::from_raw(
+            &c,
+            message(1, user_ref(5), "q", 0),
+            Some(user_ref(5)),
+            c.empty_peer_map(),
+        );
+        let query = GuestChatQuery {
+            message: msg,
+            reference_messages: Vec::new(),
+            raw: tl::types::UpdateBotGuestChatQuery {
+                query_id: 4,
+                message: message(1, user_ref(5), "q", 0),
+                reference_messages: None,
+                qts: 1,
+            }
+            .into(),
+            state: State {
+                date: 0,
+                seq: 0,
+                message_box: None,
+            },
+        };
+        assert_eq!(query.query_id(), 4);
+        let answered = query.answer(Article::new("t", "body")).await.unwrap();
+        assert!(
+            answered
+                .edit(InputMessage::new().text("later"))
+                .await
+                .unwrap()
+        );
+    }
+}

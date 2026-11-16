@@ -104,3 +104,80 @@ impl fmt::Debug for InlineSend {
             .finish()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use mtg_testkit::FakeServer;
+
+    use super::*;
+    use crate::test_util::{client, user, user_ref};
+
+    async fn send(
+        c: &Client,
+        user_id: i64,
+        msg_id: Option<tl::enums::InputBotInlineMessageId>,
+    ) -> InlineSend {
+        InlineSend {
+            raw: tl::types::UpdateBotInlineSend {
+                user_id,
+                query: "cats".into(),
+                geo: None,
+                id: "r1".into(),
+                msg_id,
+            }
+            .into(),
+            state: State {
+                date: 0,
+                seq: 0,
+                message_box: None,
+            },
+            client: c.clone(),
+            peers: c.build_peer_map(vec![user(5)], vec![]).await,
+        }
+    }
+
+    fn inline_id() -> tl::enums::InputBotInlineMessageId {
+        tl::types::InputBotInlineMessageId {
+            dc_id: 2,
+            id: 1,
+            access_hash: 2,
+        }
+        .into()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_chosen_result_exposes_its_fields() {
+        let server = FakeServer::start().await;
+        let c = client(&server);
+        let s = send(&c, 5, Some(inline_id())).await;
+        assert_eq!((s.text(), s.result_id()), ("cats", "r1"));
+        assert_eq!(s.sender_id(), PeerId::user_unchecked(5));
+        assert!(s.sender().is_some());
+        assert_eq!(s.sender_ref().await.unwrap(), Some(user_ref(5)));
+        assert!(s.message_id().is_some());
+        assert!(format!("{s:?}").contains("cats"));
+        assert!(send(&c, 6, None).await.sender().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn editing_needs_an_inline_message_id() {
+        let server = FakeServer::start().await;
+        server.on(|req: tl::functions::messages::EditInlineBotMessage| {
+            assert_eq!(req.message.as_deref(), Some("new"));
+            Ok(true)
+        });
+        let c = client(&server);
+        assert_eq!(
+            send(&c, 5, Some(inline_id()))
+                .await
+                .edit_message("new")
+                .await
+                .unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            send(&c, 5, None).await.edit_message("new").await.unwrap(),
+            None
+        );
+    }
+}

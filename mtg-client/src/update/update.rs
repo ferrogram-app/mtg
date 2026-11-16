@@ -210,3 +210,264 @@ impl Update {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use mtg_testkit::FakeServer;
+
+    use super::*;
+    use crate::test_util::{client, message, user_ref};
+
+    fn state() -> State {
+        State {
+            date: 3,
+            seq: 4,
+            message_box: None,
+        }
+    }
+
+    fn msg(id: i32) -> tl::enums::Message {
+        message(id, user_ref(5), "hi", 0)
+    }
+
+    fn no_peer() -> tl::enums::Message {
+        tl::types::MessageEmpty {
+            id: 1,
+            peer_id: None,
+        }
+        .into()
+    }
+
+    async fn convert(raw: tl::enums::Update) -> Update {
+        let server = FakeServer::start().await;
+        let c = client(&server);
+        Update::from_raw(&c, raw, state(), c.empty_peer_map())
+    }
+
+    fn new_message(m: tl::enums::Message) -> tl::enums::Update {
+        tl::types::UpdateNewMessage {
+            message: m,
+            pts: 1,
+            pts_count: 1,
+        }
+        .into()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn message_updates_become_typed_updates() {
+        let new = convert(new_message(msg(1))).await;
+        assert!(matches!(&new, Update::NewMessage(m) if m.id() == 1));
+        let channel = convert(
+            tl::types::UpdateNewChannelMessage {
+                message: msg(2),
+                pts: 1,
+                pts_count: 1,
+            }
+            .into(),
+        )
+        .await;
+        assert!(matches!(&channel, Update::NewMessage(m) if m.id() == 2));
+        let edit = convert(
+            tl::types::UpdateEditMessage {
+                message: msg(3),
+                pts: 1,
+                pts_count: 1,
+            }
+            .into(),
+        )
+        .await;
+        assert!(matches!(&edit, Update::MessageEdited(m) if m.id() == 3));
+        let edit_channel = convert(
+            tl::types::UpdateEditChannelMessage {
+                message: msg(4),
+                pts: 1,
+                pts_count: 1,
+            }
+            .into(),
+        )
+        .await;
+        assert!(matches!(&edit_channel, Update::MessageEdited(m) if m.id() == 4));
+        for u in [&new, &channel, &edit, &edit_channel] {
+            assert_eq!(u.state().date, 3);
+            assert!(matches!(
+                u.raw(),
+                tl::enums::Update::NewMessage(_)
+                    | tl::enums::Update::NewChannelMessage(_)
+                    | tl::enums::Update::EditMessage(_)
+                    | tl::enums::Update::EditChannelMessage(_)
+            ));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn messages_without_a_chat_stay_raw() {
+        let raw = convert(new_message(no_peer())).await;
+        assert!(matches!(raw, Update::Raw(_)));
+        let raw = convert(
+            tl::types::UpdateNewChannelMessage {
+                message: no_peer(),
+                pts: 1,
+                pts_count: 1,
+            }
+            .into(),
+        )
+        .await;
+        assert!(matches!(raw, Update::Raw(_)));
+        let raw = convert(
+            tl::types::UpdateEditMessage {
+                message: no_peer(),
+                pts: 1,
+                pts_count: 1,
+            }
+            .into(),
+        )
+        .await;
+        assert!(matches!(raw, Update::Raw(_)));
+        // unlike the others, an edited channel message is accepted as it is
+        let edited = convert(
+            tl::types::UpdateEditChannelMessage {
+                message: no_peer(),
+                pts: 1,
+                pts_count: 1,
+            }
+            .into(),
+        )
+        .await;
+        assert!(matches!(edited, Update::MessageEdited(_)));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn other_updates_keep_their_kind() {
+        let deleted = convert(
+            tl::types::UpdateDeleteMessages {
+                messages: vec![1, 2],
+                pts: 1,
+                pts_count: 2,
+            }
+            .into(),
+        )
+        .await;
+        assert!(matches!(&deleted, Update::MessageDeleted(d) if d.messages() == [1, 2]));
+        let deleted = convert(
+            tl::types::UpdateDeleteChannelMessages {
+                channel_id: 9,
+                messages: vec![3],
+                pts: 1,
+                pts_count: 1,
+            }
+            .into(),
+        )
+        .await;
+        assert!(matches!(&deleted, Update::MessageDeleted(d) if d.channel_id() == Some(9)));
+
+        let press = convert(
+            tl::types::UpdateBotCallbackQuery {
+                query_id: 1,
+                user_id: 5,
+                peer: tl::types::PeerUser { user_id: 5 }.into(),
+                msg_id: 2,
+                chat_instance: 0,
+                data: None,
+                game_short_name: None,
+            }
+            .into(),
+        )
+        .await;
+        assert!(matches!(press, Update::CallbackQuery(_)));
+        let inline_press = convert(
+            tl::types::UpdateInlineBotCallbackQuery {
+                query_id: 1,
+                user_id: 5,
+                msg_id: tl::types::InputBotInlineMessageId {
+                    dc_id: 2,
+                    id: 1,
+                    access_hash: 2,
+                }
+                .into(),
+                chat_instance: 0,
+                data: None,
+                game_short_name: None,
+            }
+            .into(),
+        )
+        .await;
+        assert!(matches!(inline_press, Update::CallbackQuery(_)));
+        let query = convert(
+            tl::types::UpdateBotInlineQuery {
+                query_id: 1,
+                user_id: 5,
+                query: String::new(),
+                geo: None,
+                peer_type: None,
+                offset: String::new(),
+            }
+            .into(),
+        )
+        .await;
+        assert!(matches!(query, Update::InlineQuery(_)));
+        let send = convert(
+            tl::types::UpdateBotInlineSend {
+                user_id: 5,
+                query: String::new(),
+                geo: None,
+                id: "r".into(),
+                msg_id: None,
+            }
+            .into(),
+        )
+        .await;
+        assert!(matches!(send, Update::InlineSend(_)));
+        let guest = convert(
+            tl::types::UpdateBotGuestChatQuery {
+                query_id: 1,
+                message: msg(1),
+                reference_messages: Some(vec![msg(2), msg(3)]),
+                qts: 1,
+            }
+            .into(),
+        )
+        .await;
+        let Update::GuestChatQuery(g) = &guest else {
+            panic!("not a guest chat query")
+        };
+        assert_eq!((g.message.id(), g.reference_messages.len()), (1, 2));
+        let bare = convert(
+            tl::types::UpdateBotGuestChatQuery {
+                query_id: 1,
+                message: msg(1),
+                reference_messages: None,
+                qts: 1,
+            }
+            .into(),
+        )
+        .await;
+        assert!(matches!(&bare, Update::GuestChatQuery(g) if g.reference_messages.is_empty()));
+
+        let other = convert(tl::enums::Update::Config).await;
+        assert!(matches!(other.raw(), tl::enums::Update::Config));
+        assert!(matches!(other, Update::Raw(_)));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn wrappers_dereference_to_what_they_hold() {
+        let Update::NewMessage(mut m) = convert(new_message(msg(7))).await else {
+            panic!("not a message")
+        };
+        assert_eq!(m.text(), "hi");
+        m.raw = tl::enums::Update::Config;
+        let inner = m.clone().into_inner();
+        assert_eq!(inner.id(), 7);
+        // DerefMut reaches the inner message
+        m.fetched_in = Some(user_ref(5));
+
+        let Update::Raw(mut raw) = convert(tl::enums::Update::Config).await else {
+            panic!("not raw")
+        };
+        assert!(matches!(*raw, tl::enums::Update::Config));
+        *raw = tl::enums::Update::ChannelTooLong(tl::types::UpdateChannelTooLong {
+            channel_id: 1,
+            pts: None,
+        });
+        assert!(matches!(&*raw, tl::enums::Update::ChannelTooLong(_)));
+    }
+}
