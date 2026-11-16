@@ -690,4 +690,100 @@ mod tests {
             .unwrap();
         assert!(media.is_none());
     }
+
+    fn replying(c: &Client, peer: PeerRef, id: i32, to: Option<i32>) -> Message {
+        let mut raw = message(id, peer, "r", 0);
+        if let tl::enums::Message::Message(m) = &mut raw {
+            m.reply_to = to.map(|reply_to_msg_id| {
+                tl::enums::MessageReplyHeader::Header(tl::types::MessageReplyHeader {
+                    reply_to_scheduled: false,
+                    forum_topic: false,
+                    quote: false,
+                    reply_to_ephemeral: false,
+                    reply_to_msg_id: Some(reply_to_msg_id),
+                    reply_to_peer_id: None,
+                    reply_from: None,
+                    reply_media: None,
+                    reply_to_top_id: None,
+                    quote_text: None,
+                    quote_entities: None,
+                    quote_offset: None,
+                    todo_item_id: None,
+                    poll_option: None,
+                    quote_rich: None,
+                })
+            });
+        }
+        Message::from_raw(c, raw, Some(peer), c.empty_peer_map())
+    }
+
+    fn found(messages: Vec<tl::enums::Message>) -> tl::enums::messages::Messages {
+        tl::types::messages::Messages {
+            messages,
+            topics: Vec::new(),
+            chats: Vec::new(),
+            users: Vec::new(),
+        }
+        .into()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reply_target_is_fetched_with_a_fallback_by_id() {
+        let server = FakeServer::start().await;
+        let peer = user_ref(5);
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let n = calls.clone();
+        server.on(move |req: tl::functions::messages::GetMessages| {
+            // the first try by "reply to" fails, the second asks for the id
+            if n.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                assert!(matches!(req.id[0], tl::enums::InputMessage::ReplyTo(_)));
+                return Err((400, "MESSAGE_ID_INVALID".to_string()));
+            }
+            assert!(matches!(&req.id[0], tl::enums::InputMessage::Id(i) if i.id == 3));
+            Ok(found(vec![message(3, user_ref(5), "orig", 0)]))
+        });
+        let c = client(&server);
+        let target = c
+            .get_reply_to_message(&replying(&c, peer, 4, Some(3)))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(target.id(), 3);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reply_target_from_another_chat_is_ignored() {
+        let server = FakeServer::start().await;
+        server.on(|_: tl::functions::messages::GetMessages| {
+            Ok(found(vec![message(3, user_ref(6), "other", 0)]))
+        });
+        let c = client(&server);
+        let r = c
+            .get_reply_to_message(&replying(&c, user_ref(5), 4, Some(3)))
+            .await
+            .unwrap();
+        assert!(r.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn channel_replies_use_channels_get_messages_and_no_reply_gives_none() {
+        let server = FakeServer::start().await;
+        let peer = channel_ref(9);
+        server.on(move |_: tl::functions::channels::GetMessages| {
+            Ok(found(vec![message(3, peer, "orig", 0)]))
+        });
+        let c = client(&server);
+        let target = c
+            .get_reply_to_message(&replying(&c, peer, 4, Some(3)))
+            .await
+            .unwrap();
+        assert_eq!(target.map(|m| m.id()), Some(3));
+        assert!(
+            c.get_reply_to_message(&replying(&c, peer, 5, None))
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
 }
