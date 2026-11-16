@@ -127,7 +127,7 @@ impl InputVideo {
 
     /// Sets the timestamp at which to start playing the video.
     pub fn video_timestamp(mut self, video_timestamp: Option<Duration>) -> Self {
-        self.video_timestamp = video_timestamp.map(|t| t.as_secs().try_into().unwrap());
+        self.video_timestamp = video_timestamp.map(|t| t.as_secs().try_into().unwrap_or(i32::MAX));
         self
     }
 
@@ -249,5 +249,108 @@ impl From<InputVideo> for tl::enums::InputMedia {
             video_timestamp,
         }
         .into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn file() -> Uploaded {
+        Uploaded {
+            raw: tl::types::InputFile {
+                id: 1,
+                parts: 1,
+                name: "v.mp4".into(),
+                md5_checksum: String::new(),
+            }
+            .into(),
+        }
+    }
+
+    fn doc(v: InputVideo) -> tl::types::InputMediaUploadedDocument {
+        let tl::enums::InputMedia::UploadedDocument(d) = v.into() else {
+            panic!()
+        };
+        d
+    }
+
+    fn video_attr(d: &tl::types::InputMediaUploadedDocument) -> &tl::types::DocumentAttributeVideo {
+        d.attributes
+            .iter()
+            .find_map(|a| match a {
+                tl::enums::DocumentAttribute::Video(v) => Some(v),
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn defaults_stream_and_have_no_extras() {
+        let d = doc(InputVideo::new(file()));
+        let v = video_attr(&d);
+        assert!(v.supports_streaming && !v.round_message && !v.nosound);
+        assert_eq!((v.w, v.h, v.duration), (0, 0, 0.0));
+        assert_eq!(d.attributes.len(), 2);
+        assert!(d.ttl_seconds.is_none() && d.stickers.is_none() && d.video_cover.is_none());
+    }
+
+    #[test]
+    fn every_setter_reaches_the_document() {
+        let cover: tl::enums::InputPhoto = tl::types::InputPhoto {
+            id: 1,
+            access_hash: 2,
+            file_reference: vec![],
+        }
+        .into();
+        let d = doc(InputVideo::new(file())
+            .force_file(true)
+            .spoiler(true)
+            .nosound(true)
+            .nosound_video(true)
+            .mime_type("video/mp4")
+            .thumb(Some(file()))
+            .video_cover(Some(cover))
+            .video_timestamp(Some(Duration::from_secs(4)))
+            .ttl(TimeToLive::ViewableOnce)
+            .stickers(Some(vec![]))
+            .round_message(true)
+            .supports_streaming(false)
+            .duration(Duration::from_millis(1500))
+            .size(640, 480)
+            .preload_prefix_size(Some(9))
+            .video_start_ts(Some(Duration::from_secs(2)))
+            .video_codec(Some("h264")));
+        assert!(d.force_file && d.spoiler && d.nosound_video && d.thumb.is_some());
+        assert_eq!(
+            (d.mime_type.as_str(), d.video_timestamp),
+            ("video/mp4", Some(4))
+        );
+        assert_eq!(d.ttl_seconds, Some(i32::MAX));
+        assert!(d.video_cover.is_some() && d.stickers == Some(vec![]));
+        let v = video_attr(&d);
+        assert!(v.round_message && !v.supports_streaming && v.nosound);
+        assert_eq!((v.w, v.h, v.duration), (640, 480, 1.5));
+        assert_eq!(
+            (v.preload_prefix_size, v.video_start_ts),
+            (Some(9), Some(2.0))
+        );
+        assert_eq!(v.video_codec.as_deref(), Some("h264"));
+    }
+
+    #[test]
+    fn animated_adds_an_attribute_and_clears_nosound_video() {
+        let d = doc(InputVideo::new(file()).nosound_video(true).animated(true));
+        assert!(!d.nosound_video);
+        assert!(matches!(
+            d.attributes.last(),
+            Some(tl::enums::DocumentAttribute::Animated)
+        ));
+    }
+
+    #[test]
+    fn a_huge_timestamp_saturates() {
+        let d = doc(InputVideo::new(file()).video_timestamp(Some(Duration::from_secs(u64::MAX))));
+        assert_eq!(d.video_timestamp, Some(i32::MAX));
     }
 }

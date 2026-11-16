@@ -75,7 +75,7 @@ impl InputAudio {
     }
 
     pub fn duration(mut self, duration: Duration) -> Self {
-        self.duration = duration.as_secs().try_into().unwrap();
+        self.duration = duration.as_secs().try_into().unwrap_or(i32::MAX);
         self
     }
 
@@ -136,5 +136,78 @@ impl From<InputAudio> for tl::enums::InputMedia {
             video_timestamp: None,
         }
         .into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn file() -> Uploaded {
+        Uploaded {
+            raw: tl::types::InputFile {
+                id: 1,
+                parts: 1,
+                name: "a.ogg".into(),
+                md5_checksum: String::new(),
+            }
+            .into(),
+        }
+    }
+
+    fn doc(a: InputAudio) -> tl::types::InputMediaUploadedDocument {
+        let tl::enums::InputMedia::UploadedDocument(d) = a.into() else {
+            panic!()
+        };
+        d
+    }
+
+    fn audio_attr(d: &tl::types::InputMediaUploadedDocument) -> &tl::types::DocumentAttributeAudio {
+        d.attributes
+            .iter()
+            .find_map(|a| match a {
+                tl::enums::DocumentAttribute::Audio(a) => Some(a),
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn defaults_make_a_plain_audio_document() {
+        let d = doc(InputAudio::new(file()));
+        assert!(!d.force_file && d.thumb.is_none() && d.mime_type.is_empty());
+        let a = audio_attr(&d);
+        assert!(!a.voice && a.duration == 0 && a.title.is_none() && a.waveform.is_none());
+        assert!(
+            matches!(&d.attributes[0], tl::enums::DocumentAttribute::Filename(f) if f.file_name == "a.ogg")
+        );
+    }
+
+    #[test]
+    fn every_setter_reaches_the_document() {
+        let d = doc(InputAudio::new(file())
+            .force_file(true)
+            .mime_type("audio/ogg")
+            .thumb(Some(file()))
+            .voice(true)
+            .duration(Duration::from_secs(12))
+            .title(Some("t"))
+            .performer(Some("p"))
+            .waveform(Some(vec![1, 2])));
+        assert!(d.force_file && d.thumb.is_some());
+        assert_eq!(d.mime_type, "audio/ogg");
+        let a = audio_attr(&d);
+        assert!(a.voice && a.duration == 12);
+        assert_eq!(
+            (a.title.as_deref(), a.performer.as_deref()),
+            (Some("t"), Some("p"))
+        );
+        assert_eq!(a.waveform.as_deref(), Some(&[1u8, 2][..]));
+    }
+
+    #[test]
+    fn a_huge_duration_saturates() {
+        let d = doc(InputAudio::new(file()).duration(Duration::from_secs(u64::MAX)));
+        assert_eq!(audio_attr(&d).duration, i32::MAX);
     }
 }

@@ -342,3 +342,152 @@ impl InputMedia {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn file(name: &str) -> Uploaded {
+        Uploaded {
+            raw: tl::types::InputFile {
+                id: 1,
+                parts: 1,
+                name: name.into(),
+                md5_checksum: String::new(),
+            }
+            .into(),
+        }
+    }
+
+    fn doc(m: &InputMedia) -> &tl::types::InputMediaUploadedDocument {
+        let Some(tl::enums::InputMedia::UploadedDocument(d)) = &m.media else {
+            panic!()
+        };
+        d
+    }
+
+    #[test]
+    fn time_to_live_maps_to_the_wire_value() {
+        assert_eq!(Option::<i32>::from(TimeToLive::Unlimited), None);
+        assert_eq!(
+            Option::<i32>::from(TimeToLive::ViewableOnce),
+            Some(i32::MAX)
+        );
+        assert_eq!(
+            Option::<i32>::from(TimeToLive::Duration(Duration::from_secs(30))),
+            Some(30)
+        );
+        // reserved values are avoided at both ends
+        assert_eq!(
+            Option::<i32>::from(TimeToLive::Duration(Duration::ZERO)),
+            Some(1)
+        );
+        assert_eq!(
+            Option::<i32>::from(TimeToLive::Duration(Duration::from_secs(u64::MAX))),
+            Some(i32::MAX - 1)
+        );
+    }
+
+    #[test]
+    fn caption_entities_and_reply_are_stored() {
+        let m = InputMedia::new()
+            .caption("c")
+            .reply_to(Some(3))
+            .fmt_entities([tl::enums::MessageEntity::Bold(
+                tl::types::MessageEntityBold {
+                    offset: 0,
+                    length: 1,
+                },
+            )]);
+        assert_eq!(
+            (m.caption.as_str(), m.reply_to, m.entities.len()),
+            ("c", Some(3), 1)
+        );
+    }
+
+    #[cfg(feature = "markdown")]
+    #[test]
+    fn markdown_caption() {
+        let m = InputMedia::new().markdown("**b**");
+        assert_eq!((m.caption.as_str(), m.entities.len()), ("b", 1));
+    }
+
+    #[cfg(feature = "html")]
+    #[test]
+    fn html_caption() {
+        let m = InputMedia::new().html("<b>b</b>");
+        assert_eq!((m.caption.as_str(), m.entities.len()), ("b", 1));
+    }
+
+    #[test]
+    fn photos_and_external_media_take_the_ttl_set_before() {
+        let m = InputMedia::new()
+            .media_ttl(TimeToLive::ViewableOnce)
+            .photo(file("a.jpg"));
+        assert!(
+            matches!(m.media, Some(tl::enums::InputMedia::UploadedPhoto(p)) if p.ttl_seconds == Some(i32::MAX))
+        );
+        let m = InputMedia::new().photo_url("https://x/a.jpg");
+        assert!(
+            matches!(m.media, Some(tl::enums::InputMedia::PhotoExternal(p)) if p.url == "https://x/a.jpg" && p.ttl_seconds.is_none())
+        );
+        let m = InputMedia::new().document_url("https://x/a.bin");
+        assert!(
+            matches!(m.media, Some(tl::enums::InputMedia::DocumentExternal(d)) if d.url == "https://x/a.bin")
+        );
+        let m = InputMedia::new().media(tl::types::InputMediaEmpty {});
+        assert!(matches!(m.media, Some(tl::enums::InputMedia::Empty)));
+    }
+
+    #[test]
+    fn documents_guess_or_override_the_mime_type() {
+        let m = InputMedia::new().document(file("a.png"));
+        assert_eq!(doc(&m).mime_type, "image/png");
+        assert!(!doc(&m).force_file);
+        let m = InputMedia::new().document(file("noext"));
+        assert_eq!(doc(&m).mime_type, "application/octet-stream");
+        let m = InputMedia::new()
+            .mime_type("text/x-custom")
+            .file(file("a.png"));
+        assert_eq!(doc(&m).mime_type, "text/x-custom");
+        assert!(doc(&m).force_file);
+    }
+
+    #[test]
+    fn thumbnail_and_attributes_need_an_uploaded_document() {
+        let m = InputMedia::new()
+            .document(file("a.mp3"))
+            .thumbnail(file("t.png"))
+            .attribute(Attribute::FileName("x".into()));
+        assert!(doc(&m).thumb.is_some());
+        assert!(
+            doc(&m).attributes.iter().any(
+                |a| matches!(a, tl::enums::DocumentAttribute::Filename(f) if f.file_name == "x")
+            )
+        );
+
+        let m = InputMedia::new()
+            .photo_url("u")
+            .thumbnail(file("t.png"))
+            .attribute(Attribute::FileName("x".into()));
+        assert!(matches!(
+            m.media,
+            Some(tl::enums::InputMedia::PhotoExternal(_))
+        ));
+    }
+
+    #[test]
+    fn copy_media_takes_the_input_form_of_a_media() {
+        let dice = Media::Dice(crate::media::Dice {
+            raw: tl::types::MessageMediaDice {
+                value: 1,
+                emoticon: "🎲".into(),
+                game_outcome: None,
+            },
+        });
+        assert!(matches!(
+            InputMedia::new().copy_media(&dice).media,
+            Some(tl::enums::InputMedia::Dice(_))
+        ));
+    }
+}
