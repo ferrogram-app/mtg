@@ -298,3 +298,280 @@ impl Uploaded {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn text(s: &str) -> tl::enums::TextWithEntities {
+        tl::types::TextWithEntities {
+            text: s.into(),
+            entities: vec![],
+        }
+        .into()
+    }
+
+    fn point() -> tl::enums::GeoPoint {
+        tl::enums::GeoPoint::Point(tl::types::GeoPoint {
+            long: 2.5,
+            lat: 1.5,
+            access_hash: 9,
+            accuracy_radius: Some(30),
+        })
+    }
+
+    fn geo(point: tl::enums::GeoPoint) -> tl::types::MessageMediaGeo {
+        tl::types::MessageMediaGeo { geo: point }
+    }
+
+    fn venue(point: tl::enums::GeoPoint) -> tl::types::MessageMediaVenue {
+        tl::types::MessageMediaVenue {
+            geo: point,
+            title: "t".into(),
+            address: "a".into(),
+            provider: "p".into(),
+            venue_id: "v".into(),
+            venue_type: "vt".into(),
+        }
+    }
+
+    fn geolive(point: tl::enums::GeoPoint) -> tl::types::MessageMediaGeoLive {
+        tl::types::MessageMediaGeoLive {
+            geo: point,
+            heading: Some(90),
+            period: 60,
+            proximity_notification_radius: Some(5),
+        }
+    }
+
+    fn poll_media(
+        results: Option<Vec<tl::enums::PollAnswerVoters>>,
+    ) -> tl::types::MessageMediaPoll {
+        tl::types::MessageMediaPoll {
+            poll: tl::enums::Poll::Poll(tl::types::Poll {
+                id: 1,
+                closed: true,
+                public_voters: false,
+                multiple_choice: false,
+                quiz: true,
+                open_answers: false,
+                revoting_disabled: false,
+                shuffle_answers: false,
+                hide_results_until_close: false,
+                creator: false,
+                subscribers_only: false,
+                question: text("q?"),
+                answers: vec![
+                    tl::types::PollAnswer {
+                        text: text("a"),
+                        option: vec![1],
+                        media: None,
+                        added_by: None,
+                        date: None,
+                    }
+                    .into(),
+                ],
+                close_period: None,
+                close_date: None,
+                countries_iso2: None,
+                hash: 0,
+            }),
+            results: tl::enums::PollResults::Results(Box::new(tl::types::PollResults {
+                min: false,
+                has_unread_votes: false,
+                can_view_stats: false,
+                results,
+                total_voters: Some(7),
+                recent_voters: None,
+                solution: None,
+                solution_entities: None,
+                solution_media: None,
+            })),
+            attached_media: None,
+        }
+    }
+
+    #[test]
+    fn contact_round_trips() {
+        let c = Contact::from_raw_media(tl::types::MessageMediaContact {
+            phone_number: "+1".into(),
+            first_name: "A".into(),
+            last_name: "B".into(),
+            vcard: "VC".into(),
+            user_id: 5,
+        });
+        assert_eq!(
+            (c.phone_number(), c.first_name(), c.last_name(), c.vcard()),
+            ("+1", "A", "B", "VC")
+        );
+        let input = c.to_raw_input_media();
+        assert_eq!(input.phone_number, "+1");
+        assert_eq!(input.last_name, "B");
+        assert_eq!(input.vcard, "VC");
+    }
+
+    #[test]
+    fn poll_accessors_and_input() {
+        let p = Poll::from_raw_media(poll_media(Some(vec![
+            tl::types::PollAnswerVoters {
+                chosen: true,
+                correct: true,
+                option: vec![1],
+                voters: Some(4),
+                recent_voters: None,
+            }
+            .into(),
+        ])));
+        assert!(p.is_quiz() && p.closed());
+        assert_eq!(p.iter_answers().count(), 1);
+        assert_eq!(p.total_voters(), Some(7));
+        let voters: Vec<_> = p.iter_voters_summary().unwrap().collect();
+        assert_eq!(voters[0].voters, Some(4));
+        let tl::enums::TextWithEntities::Entities(q) = p.question();
+        assert_eq!(q.text, "q?");
+        let input = p.to_raw_input_media();
+        assert!(input.correct_answers.is_none() && input.solution.is_none());
+
+        let none = Poll::from_raw_media(poll_media(None));
+        assert!(none.iter_voters_summary().is_none());
+    }
+
+    #[test]
+    fn geo_points() {
+        assert!(Geo::from_raw_media(geo(tl::enums::GeoPoint::Empty)).is_none());
+        let g = Geo::from_raw_media(geo(point())).unwrap();
+        assert_eq!(
+            (g.latitue(), g.longitude(), g.accuracy_radius()),
+            (1.5, 2.5, Some(30))
+        );
+        assert_eq!(g.to_raw_input_media().geo_point, g.to_raw_input_geo_point());
+        let tl::enums::InputGeoPoint::Point(p) = g.to_raw_input_geo_point() else {
+            panic!()
+        };
+        assert_eq!((p.lat, p.long, p.accuracy_radius), (1.5, 2.5, Some(30)));
+    }
+
+    #[test]
+    fn dice() {
+        let d = Dice::from_raw_media(tl::types::MessageMediaDice {
+            value: 4,
+            emoticon: "🎲".into(),
+            game_outcome: None,
+        });
+        assert_eq!((d.emoji(), d.value()), ("🎲", 4));
+        assert_eq!(d.to_raw_input_media().emoticon, "🎲");
+    }
+
+    #[test]
+    fn venue_with_and_without_point() {
+        let v = Venue::from_raw_media(venue(point()));
+        assert_eq!(
+            (
+                v.title(),
+                v.address(),
+                v.provider(),
+                v.venue_id(),
+                v.venue_type()
+            ),
+            ("t", "a", "p", "v", "vt")
+        );
+        assert!(matches!(
+            v.to_raw_input_media().geo_point,
+            tl::enums::InputGeoPoint::Point(_)
+        ));
+        let no_geo = Venue::from_raw_media(venue(tl::enums::GeoPoint::Empty));
+        let input = no_geo.to_raw_input_media();
+        assert!(matches!(input.geo_point, tl::enums::InputGeoPoint::Empty));
+        assert_eq!(input.title, "t");
+    }
+
+    #[test]
+    fn geo_live_with_and_without_point() {
+        let g = GeoLive::from_raw_media(geolive(point()));
+        assert_eq!(
+            (g.heading(), g.period(), g.proximity_notification_radius()),
+            (Some(90), 60, Some(5))
+        );
+        let input = g.to_raw_input_media();
+        assert_eq!(
+            (input.period, input.heading, input.stopped),
+            (Some(60), Some(90), false)
+        );
+        assert!(matches!(
+            input.geo_point,
+            tl::enums::InputGeoPoint::Point(_)
+        ));
+        let none = GeoLive::from_raw_media(geolive(tl::enums::GeoPoint::Empty));
+        assert!(matches!(
+            none.to_raw_input_media().geo_point,
+            tl::enums::InputGeoPoint::Empty
+        ));
+    }
+
+    #[test]
+    fn uploaded_names() {
+        let file = |name: &str| {
+            Uploaded::from_raw(
+                tl::types::InputFile {
+                    id: 1,
+                    parts: 1,
+                    name: name.into(),
+                    md5_checksum: String::new(),
+                }
+                .into(),
+            )
+        };
+        assert_eq!(file("a.txt").name(), "a.txt");
+        let big = Uploaded::from_raw(
+            tl::types::InputFileBig {
+                id: 1,
+                parts: 9,
+                name: "b.bin".into(),
+            }
+            .into(),
+        );
+        assert_eq!(big.name(), "b.bin");
+        let story = Uploaded::from_raw(
+            tl::types::InputFileStoryDocument {
+                id: tl::enums::InputDocument::Empty,
+            }
+            .into(),
+        );
+        assert_eq!(story.name(), "");
+    }
+
+    #[test]
+    fn media_enum_dispatch() {
+        use tl::enums::MessageMedia as M;
+
+        assert!(Media::from_raw(M::Empty).is_none());
+        assert!(Media::from_raw(M::Unsupported).is_none());
+        assert!(Media::from_raw(M::Geo(geo(tl::enums::GeoPoint::Empty))).is_none());
+
+        let cases = [
+            M::Geo(geo(point())),
+            M::Contact(tl::types::MessageMediaContact {
+                phone_number: "1".into(),
+                first_name: String::new(),
+                last_name: String::new(),
+                vcard: String::new(),
+                user_id: 0,
+            }),
+            M::Venue(venue(point())),
+            M::GeoLive(geolive(point())),
+            M::Poll(Box::new(poll_media(None))),
+            M::Dice(tl::types::MessageMediaDice {
+                value: 1,
+                emoticon: "🎯".into(),
+                game_outcome: None,
+            }),
+        ];
+        for raw in cases {
+            let media = Media::from_raw(raw).unwrap();
+            assert!(media.to_raw_input_media().is_some());
+            assert_eq!(media.size(), None);
+            assert!(media.to_raw_input_location().is_none());
+            assert_eq!(media.dc_id(), None);
+        }
+    }
+}
