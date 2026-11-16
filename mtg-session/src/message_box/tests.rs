@@ -12,11 +12,11 @@ use std::time::Duration;
 
 use mtg_tl_types as tl;
 
-use super::defs::PtsInfo;
 use super::defs::{
     Gap, MessageBox, MessageBoxes, NO_DATE, NO_PTS, NO_SEQ, NO_UPDATES_TIMEOUT, State,
     UpdateAndPeers,
 };
+use super::defs::{Key, PtsInfo};
 use super::{PrematureEndReason, next_updates_deadline};
 use crate::message_box::POSSIBLE_GAP_TIMEOUT;
 use crate::message_box::defs::UpdatesLike;
@@ -886,4 +886,152 @@ fn a_partial_difference_continues_from_its_intermediate_state() {
         message_boxes.get_difference(),
         Some(get_difference(60, 20, 35))
     );
+}
+
+fn loaded() -> MessageBoxes {
+    reset_time();
+    let mut boxes = MessageBoxes::new();
+    boxes.set_state(state(10, 20, 100, 200));
+    boxes
+}
+
+fn too_long_channel(channel_id: i64, pts: Option<i32>) -> tl::enums::Update {
+    tl::types::UpdateChannelTooLong { channel_id, pts }.into()
+}
+
+fn raw_updates(updates: Vec<tl::enums::Update>) -> UpdatesLike {
+    UpdatesLike::Updates(tl::enums::Updates::Updates(tl::types::Updates {
+        updates,
+        users: Vec::new(),
+        chats: Vec::new(),
+        date: NO_DATE,
+        seq: NO_SEQ,
+    }))
+}
+
+#[test]
+fn a_message_box_reports_its_pts() {
+    assert_eq!(MessageBox::Common { pts: 1 }.pts(), 1);
+    assert_eq!(MessageBox::Secondary { qts: 2 }.pts(), 2);
+    assert_eq!(
+        MessageBox::Channel {
+            channel_id: 9,
+            pts: 3
+        }
+        .pts(),
+        3
+    );
+    for (key, expected) in [
+        (Key::Common, MessageBox::Common { pts: 5 }),
+        (Key::Secondary, MessageBox::Secondary { qts: 5 }),
+        (
+            Key::Channel(9),
+            MessageBox::Channel {
+                channel_id: 9,
+                pts: 5,
+            },
+        ),
+    ] {
+        assert_eq!(
+            MessageBox::from(PtsInfo {
+                key,
+                pts: 5,
+                count: 1
+            }),
+            expected
+        );
+    }
+}
+
+#[test]
+fn channel_too_long_and_pts_free_updates_in_a_batch() {
+    let mut boxes = loaded();
+    let (result, _, _) = boxes
+        .process_updates(raw_updates(vec![
+            too_long_channel(9, Some(50)),
+            tl::enums::Update::Config,
+            too_long_channel(8, None),
+        ]))
+        .unwrap();
+    // only the update that needs no ordering is handed out
+    assert_eq!(result.len(), 1);
+    assert!(matches!(result[0].0, tl::enums::Update::Config));
+    assert!(result[0].1.message_box.is_none());
+    // channel 9 now has a pts and a pending difference; channel 8 has no state at all
+    assert_eq!(boxes.get_channel_difference().map(|d| d.pts), Some(50));
+    assert!(
+        boxes
+            .session_state()
+            .channels
+            .iter()
+            .any(|c| c.id == 9 && c.pts == 50)
+    );
+}
+
+#[test]
+fn updates_too_long_is_a_gap_and_starts_a_difference() {
+    let mut boxes = loaded();
+    assert_eq!(boxes.get_difference(), None);
+    let too_long = UpdatesLike::Updates(tl::enums::Updates::TooLong);
+    assert_eq!(boxes.process_updates(too_long), Err(Gap));
+    assert!(boxes.get_difference().is_some());
+    // while a difference is pending the deadline is "now"
+    assert_eq!(boxes.check_deadlines(), boxes.check_deadlines());
+}
+
+fn plain_difference(
+    messages: Vec<tl::enums::Message>,
+    encrypted: Vec<tl::enums::EncryptedMessage>,
+) -> tl::enums::updates::Difference {
+    tl::types::updates::Difference {
+        new_messages: messages,
+        new_encrypted_messages: encrypted,
+        other_updates: Vec::new(),
+        chats: Vec::new(),
+        users: Vec::new(),
+        state: state(11, 21, 101, 201).into(),
+    }
+    .into()
+}
+
+#[test]
+fn a_difference_turns_its_messages_into_updates() {
+    let mut boxes = loaded();
+    let _ = boxes.process_updates(UpdatesLike::Updates(tl::enums::Updates::TooLong));
+    let enc = tl::enums::EncryptedMessage::Message(tl::types::EncryptedMessage {
+        random_id: 1,
+        chat_id: 2,
+        date: 3,
+        bytes: Vec::new(),
+        file: tl::enums::EncryptedFile::Empty,
+    });
+    let msg: tl::enums::Message = tl::types::MessageEmpty {
+        id: 7,
+        peer_id: None,
+    }
+    .into();
+    let (updates, _, _) = boxes.apply_difference(plain_difference(vec![msg], vec![enc]));
+    assert_eq!(updates.len(), 2);
+    assert!(matches!(updates[0].0, tl::enums::Update::NewMessage(_)));
+    assert!(matches!(
+        updates[1].0,
+        tl::enums::Update::NewEncryptedMessage(_)
+    ));
+    assert_eq!(
+        updates[0].1.message_box,
+        Some(MessageBox::Common { pts: 101 })
+    );
+    assert_eq!(
+        updates[1].1.message_box,
+        Some(MessageBox::Secondary { qts: 201 })
+    );
+    assert_eq!(boxes.session_state().pts, 101);
+}
+
+#[test]
+fn ending_a_channel_difference_nobody_asked_for_is_harmless() {
+    let mut boxes = loaded();
+    boxes.end_channel_difference(PrematureEndReason::TemporaryServerIssues);
+    assert_eq!(boxes.get_channel_difference(), None);
+    assert!(boxes.get_difference().is_none());
 }
