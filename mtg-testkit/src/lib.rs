@@ -58,6 +58,7 @@ pub struct FakeServer {
     // separate lock: handlers run while `state` is held
     seen: Arc<Mutex<Vec<&'static str>>>,
     connections: Arc<std::sync::atomic::AtomicUsize>,
+    layered: Arc<std::sync::atomic::AtomicUsize>,
     /// `Some(secret)`: behave as an MTProxy (obfuscated2 with this secret) in front of the server.
     proxy: Option<([u8; 16], bool)>,
     proxy_dcs: Arc<Mutex<Vec<i16>>>,
@@ -117,6 +118,7 @@ impl FakeServer {
             state: Default::default(),
             seen: Default::default(),
             connections: Default::default(),
+            layered: Default::default(),
             proxy,
             proxy_dcs: Default::default(),
         };
@@ -157,6 +159,11 @@ impl FakeServer {
     /// request, in order). Service messages (pings, acks, containers) are never affected.
     pub fn inject(&self, fault: Fault) {
         self.state.lock().unwrap().faults.push_back(fault);
+    }
+
+    /// How many requests arrived wrapped in `invokeWithLayer` (the first of a CDN connection does).
+    pub fn layered_requests(&self) -> usize {
+        self.layered.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// How many TCP connections have been accepted so far.
@@ -366,6 +373,8 @@ impl FakeServer {
         let mut id = u32::deserialize(&mut buf).unwrap();
         while id == 0xda9b0d0d || id == 0xc1cd5ea9 {
             if id == 0xda9b0d0d {
+                self.layered
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 i32::deserialize(&mut buf).unwrap();
             } else {
                 // initConnection: flags, api_id, six strings, optional proxy / params

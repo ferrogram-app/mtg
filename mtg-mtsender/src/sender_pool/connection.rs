@@ -43,8 +43,16 @@ impl SenderPoolRunner {
                         return ControlFlow::Continue(());
                     }
                 };
-                let connection = &self.connections[index];
-                let _ = connection.rpc_tx.send(Rpc { body, tx });
+                let body = if std::mem::take(&mut self.connections[index].needs_init) {
+                    self.with_init_connection(body)
+                } else {
+                    body
+                };
+                let _ = self.connections[index].rpc_tx.send(Rpc { body, tx });
+                ControlFlow::Continue(())
+            }
+            Request::CdnKeys(keys) => {
+                self.cdn_keys = keys;
                 ControlFlow::Continue(())
             }
             Request::CheckRetry {
@@ -141,8 +149,16 @@ impl SenderPoolRunner {
         dc_id: i32,
         media: bool,
     ) -> Result<&ConnectionInfo, InvocationError> {
+        let cdn = self.cdn_addresses.contains_key(&dc_id);
         let mut dc_option = match self.session.dc_option(dc_id)? {
             Some(x) => x,
+            // a CDN datacenter is not in the session until its first connection
+            None if cdn => DcOption {
+                id: dc_id,
+                ipv4: SocketAddrV4::new(Ipv4Addr::from_bits(0), 0),
+                ipv6: SocketAddrV6::new(Ipv6Addr::from_bits(0), 0, 0, 0),
+                auth_key: None,
+            },
             None => return Err(InvocationError::InvalidDc),
         };
 
@@ -174,6 +190,7 @@ impl SenderPoolRunner {
         self.connections.push(ConnectionInfo {
             dc_id,
             media,
+            needs_init: cdn,
             rpc_tx,
             abort_handle,
         });
@@ -238,11 +255,14 @@ impl SenderPoolRunner {
         } else {
             dc_option.ipv4.into()
         };
+        let cdn = self.cdn_addresses.contains_key(&dc_option.id);
         let stored = if media {
             self.media_addresses
                 .get(&dc_option.id)
                 .cloned()
                 .unwrap_or_default()
+        } else if cdn {
+            self.cdn_addresses[&dc_option.id].clone()
         } else {
             self.session.dc_addresses(dc_option.id)?
         };
@@ -253,7 +273,7 @@ impl SenderPoolRunner {
                 .await
                 .map_err(InvocationError::Io)?
                 .collect(),
-            None if media => stored
+            None if media || cdn => stored
                 .iter()
                 .copied()
                 .filter(|a| a.is_ipv6() == use_ipv6)
@@ -267,7 +287,9 @@ impl SenderPoolRunner {
             );
             match attempt.await {
                 Ok(Ok((sender, config))) => {
-                    self.update_config(config).await?;
+                    if let Some(config) = config {
+                        self.update_config(config).await?;
+                    }
                     return Ok((sender, address));
                 }
                 Ok(Err(e)) => {
@@ -292,7 +314,8 @@ impl SenderPoolRunner {
     ) -> Result<
         (
             Sender<Box<dyn transport::Transport + Send>, mtp::Encrypted>,
-            tl::types::Config,
+            // none for a CDN datacenter
+            Option<tl::types::Config>,
         ),
         InvocationError,
     > {
@@ -357,6 +380,35 @@ impl SenderPoolRunner {
             },
         };
 
+        if self.cdn_addresses.contains_key(&dc_id) {
+            // A CDN DC only answers `getCdnFile`: no `getConfig` here (`initConnection` goes
+            // with the first request), and its key must come from `help.getCdnConfig`.
+            let sender = if let Some(auth_key) = auth_key {
+                let offset = self.time_offset.load(Ordering::Relaxed);
+                let mtp = mtp::Encrypted::build().time_offset(offset).finish(auth_key);
+                Sender::connect(transport(), mtp, addr())
+                    .await
+                    .map_err(InvocationError::Io)?
+            } else {
+                let keys: Vec<_> = self
+                    .cdn_keys
+                    .iter()
+                    .filter(|(id, _)| *id == dc_id)
+                    .map(|(_, key)| key.clone())
+                    .collect();
+                if keys.is_empty() {
+                    return Err(InvocationError::Dropped(
+                        "no CDN public key for this datacenter",
+                    ));
+                }
+                let plain = Sender::connect(transport(), mtp::Plain::new(), addr())
+                    .await
+                    .map_err(InvocationError::Io)?;
+                crate::generate_cdn_auth_key(plain, &keys).await?
+            };
+            return Ok((sender, None));
+        }
+
         let mut sender = if let Some(auth_key) = auth_key {
             let offset = self.time_offset.load(Ordering::Relaxed);
             let mtp = mtp::Encrypted::build().time_offset(offset).finish(auth_key);
@@ -378,7 +430,37 @@ impl SenderPoolRunner {
             }
             Err(e) => return Err(e),
         };
-        Ok((sender, remote_config))
+        Ok((sender, Some(remote_config)))
+    }
+
+    /// `invokeWithLayer(initConnection(body))`, the way the first request of a CDN connection
+    /// is sent. Nothing private goes in it: only the app and device names of the configuration.
+    fn with_init_connection(&self, body: Vec<u8>) -> Vec<u8> {
+        struct Raw(Vec<u8>);
+        impl tl::Serializable for Raw {
+            fn serialize(&self, sink: &mut impl FnMut(&[u8])) {
+                sink(&self.0)
+            }
+        }
+        impl tl::RemoteCall for Raw {
+            type Return = Vec<u8>;
+        }
+        let params = &self.connection_params;
+        tl::Serializable::to_bytes(&tl::functions::InvokeWithLayer {
+            layer: tl::LAYER,
+            query: tl::functions::InitConnection {
+                api_id: self.api_id,
+                device_model: params.device_model.clone(),
+                system_version: params.system_version.clone(),
+                app_version: params.app_version.clone(),
+                system_lang_code: params.system_lang_code.clone(),
+                lang_pack: "".into(),
+                lang_code: params.lang_code.clone(),
+                proxy: None,
+                params: None,
+                query: Raw(body),
+            },
+        })
     }
 
     pub(super) async fn update_config(
@@ -387,6 +469,21 @@ impl SenderPoolRunner {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut lists: std::collections::BTreeMap<i32, Vec<SocketAddr>> = Default::default();
         let mut media: HashMap<i32, Vec<SocketAddr>> = HashMap::new();
+        let mut cdn: HashMap<i32, Vec<SocketAddr>> = HashMap::new();
+        for option in config
+            .dc_options
+            .iter()
+            .map(|tl::enums::DcOption::Option(option)| option)
+            .filter(|option| option.cdn && !option.tcpo_only)
+        {
+            if let Some(address) = option_address(option) {
+                let list = cdn.entry(option.id).or_default();
+                if !list.contains(&address) {
+                    list.push(address);
+                }
+            }
+        }
+        self.cdn_addresses = cdn;
         for option in config
             .dc_options
             .iter()

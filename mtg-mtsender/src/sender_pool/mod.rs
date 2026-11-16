@@ -61,6 +61,8 @@ enum Request {
     Disconnect {
         dc_id: i32,
     },
+    /// The RSA keys CDN datacenters may sign their handshake with, by DC id.
+    CdnKeys(Vec<(i32, mtg_crypto::rsa::Key)>),
     Quit,
 }
 
@@ -72,6 +74,9 @@ struct Rpc {
 struct ConnectionInfo {
     dc_id: i32,
     media: bool,
+    /// A CDN connection starts without `initConnection` (a CDN DC does not answer `getConfig`):
+    /// the first request is wrapped in it instead.
+    needs_init: bool,
     rpc_tx: mpsc::UnboundedSender<Rpc>,
     abort_handle: AbortHandle,
 }
@@ -133,6 +138,10 @@ pub struct SenderPoolRunner {
     /// `media_only` addresses per DC from the last `help.getConfig` (RAM only, refilled on every
     /// connect).
     media_addresses: HashMap<i32, Vec<SocketAddr>>,
+    /// Addresses of the CDN datacenters from the last `help.getConfig` (RAM only). A DC id found
+    /// here is a CDN one: it connects with `cdn_keys` and `initConnection` on its first request.
+    cdn_addresses: HashMap<i32, Vec<SocketAddr>>,
+    cdn_keys: Vec<(i32, mtg_crypto::rsa::Key)>,
     #[cfg(feature = "doh")]
     dns_fallback_tried: bool,
     connection_pool: JoinSet<Result<(), ReadError>>,
@@ -202,6 +211,20 @@ impl SenderPoolHandle {
             .map_err(|_| InvocationError::Dropped("SenderPoolRunner was dropped at send"))?;
         rx.await
             .map_err(|_| InvocationError::Dropped("SenderPoolRunner was dropped during receive"))?
+    }
+
+    /// Tells the pool which RSA keys the CDN datacenters sign their handshake with (the answer
+    /// of `help.getCdnConfig`). A CDN datacenter is never trusted with any other key. Keys that
+    /// are not valid PEM are skipped.
+    pub fn set_cdn_keys(&self, config: &tl::types::CdnConfig) -> bool {
+        let keys = config
+            .public_keys
+            .iter()
+            .filter_map(|tl::enums::CdnPublicKey::Key(k)| {
+                mtg_crypto::rsa::Key::from_pem(&k.public_key).map(|key| (k.dc_id, key))
+            })
+            .collect();
+        self.0.send(Request::CdnKeys(keys)).is_ok()
     }
 
     /// Communicate with the running [`SenderPoolRunner`] instance
@@ -338,6 +361,8 @@ impl SenderPool {
                 time_offset: Arc::new(AtomicI32::new(0)),
                 unknown_key: HashMap::new(),
                 media_addresses: HashMap::new(),
+                cdn_addresses: HashMap::new(),
+                cdn_keys: Vec::new(),
                 #[cfg(feature = "doh")]
                 dns_fallback_tried: false,
                 connection_pool: JoinSet::new(),
@@ -429,6 +454,7 @@ impl fmt::Debug for Request {
                 )
                 .field("tx", tx)
                 .finish(),
+            Self::CdnKeys(keys) => f.debug_tuple("CdnKeys").field(&keys.len()).finish(),
             Self::CheckRetry {
                 dc_id,
                 error,

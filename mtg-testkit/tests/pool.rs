@@ -613,3 +613,105 @@ async fn other_difference_errors_are_not_retried() {
     assert_eq!(asked, 1);
     handle.quit();
 }
+
+fn cdn_config(port: u16) -> tl::enums::Config {
+    let tl::enums::Config::Config(mut config) = mtg_testkit::config();
+    config.dc_options = vec![tl::enums::DcOption::Option(tl::types::DcOption {
+        ipv6: false,
+        media_only: false,
+        tcpo_only: false,
+        cdn: true,
+        r#static: false,
+        this_port_only: false,
+        id: 203,
+        ip_address: "127.0.0.1".into(),
+        port: port as i32,
+        secret: None,
+    })];
+    tl::enums::Config::Config(config)
+}
+
+fn get_cdn_file() -> tl::functions::upload::GetCdnFile {
+    tl::functions::upload::GetCdnFile {
+        file_token: vec![1],
+        offset: 0,
+        limit: 4096,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cdn_dc_gets_initconnection_with_its_first_request_only() {
+    use mtg_session::Session;
+    use mtg_session::types::DcOption;
+    let server = FakeServer::start().await;
+    let port = server.addr.port();
+    server.on(move |_: tl::functions::help::GetConfig| Ok(cdn_config(port)));
+    server.on(|_: tl::functions::upload::GetCdnFile| {
+        Ok(tl::enums::upload::CdnFile::File(
+            tl::types::upload::CdnFile {
+                bytes: vec![7; 4096],
+            },
+        ))
+    });
+    let session = server.session();
+    let mtg_session::types::DcOption { ipv4, ipv6, .. } = session.dc_option(2).unwrap().unwrap();
+    session
+        .set_dc_option(&DcOption {
+            id: 203,
+            ipv4,
+            ipv6,
+            auth_key: Some(mtg_testkit::KEY),
+        })
+        .await
+        .unwrap();
+    let pool = SenderPool::new(session, 1);
+    tokio::spawn(pool.runner.run());
+    let handle = pool.handle;
+
+    // the first connection brings the config that lists DC 203 as a CDN one
+    handle
+        .invoke_in_dc(2, &tl::functions::help::GetConfig {})
+        .await
+        .unwrap();
+    assert_eq!((server.connections(), server.layered_requests()), (1, 1));
+
+    let tl::enums::upload::CdnFile::File(file) =
+        handle.invoke_in_dc(203, &get_cdn_file()).await.unwrap()
+    else {
+        panic!("not a file")
+    };
+    assert_eq!(file.bytes.len(), 4096);
+    // a new connection, and its first request carried initConnection
+    assert_eq!((server.connections(), server.layered_requests()), (2, 2));
+    handle.invoke_in_dc(203, &get_cdn_file()).await.unwrap();
+    assert_eq!((server.connections(), server.layered_requests()), (2, 2));
+    handle.quit();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cdn_dc_without_a_key_or_a_public_key_is_not_connected() {
+    let server = FakeServer::start().await;
+    let port = server.addr.port();
+    server.on(move |_: tl::functions::help::GetConfig| Ok(cdn_config(port)));
+    let handle = pool(&server).await;
+    handle
+        .invoke_in_dc(2, &tl::functions::help::GetConfig {})
+        .await
+        .unwrap();
+    // no auth key for DC 203 and no key from getCdnConfig to trust: no handshake is attempted
+    let error = handle.invoke_in_dc(203, &get_cdn_file()).await.unwrap_err();
+    assert!(
+        matches!(error, mtg_mtsender::InvocationError::Dropped(m) if m.contains("CDN public key")),
+        "{error:?}"
+    );
+    assert_eq!(server.connections(), 1);
+    // keys that are not PEM are skipped
+    assert!(handle.set_cdn_keys(&tl::types::CdnConfig {
+        public_keys: vec![tl::enums::CdnPublicKey::Key(tl::types::CdnPublicKey {
+            dc_id: 203,
+            public_key: "garbage".into(),
+        })],
+    }));
+    assert!(handle.invoke_in_dc(203, &get_cdn_file()).await.is_err());
+    handle.quit();
+}

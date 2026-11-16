@@ -44,6 +44,6 @@ pub use fallback::{
 pub use fallback::{doh, fetch_and_apply};
 pub use mtproxy::{MtProxy, MtProxyError};
 pub use net::ServerAddr;
-pub use sender::{Sender, connect, connect_with_auth, generate_auth_key};
+pub use sender::{Sender, connect, connect_with_auth, generate_auth_key, generate_cdn_auth_key};
 pub use sender_pool::{SenderPool, SenderPoolFatHandle, SenderPoolHandle, SenderPoolRunner};
 pub use updates_receiver::UpdatesReceiver;

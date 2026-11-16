@@ -20,14 +20,32 @@ pub async fn connect<T: Transport>(
 /// Uses the input plain sender to carry the Authorization Key generation process,
 /// and returns an encrypted sender reusing the same connection, transport and buffers.
 pub async fn generate_auth_key<T: Transport>(
+    sender: Sender<T, mtp::Plain>,
+) -> Result<Sender<T, mtp::Encrypted>, InvocationError> {
+    generate_auth_key_with(sender, None).await
+}
+
+/// [`generate_auth_key`] for a CDN DC: only `keys` (from `help.getCdnConfig`) are trusted.
+pub async fn generate_cdn_auth_key<T: Transport>(
+    sender: Sender<T, mtp::Plain>,
+    keys: &[mtg_crypto::rsa::Key],
+) -> Result<Sender<T, mtp::Encrypted>, InvocationError> {
+    generate_auth_key_with(sender, Some(keys)).await
+}
+
+async fn generate_auth_key_with<T: Transport>(
     mut sender: Sender<T, mtp::Plain>,
+    keys: Option<&[mtg_crypto::rsa::Key]>,
 ) -> Result<Sender<T, mtp::Encrypted>, InvocationError> {
     info!("generating new authorization key...");
     let (request, data) = authentication::step1()?;
     debug!("gen auth key: sending step 1");
     let response = sender.invoke(&request).await?;
     debug!("gen auth key: starting step 2");
-    let (request, data) = authentication::step2(data, response)?;
+    let (request, data) = match keys {
+        None => authentication::step2(data, response)?,
+        Some(keys) => authentication::step2_with_keys(data, response, keys)?,
+    };
     debug!("gen auth key: sending step 2");
     let response = sender.invoke(&request).await?;
     debug!("gen auth key: starting step 3");

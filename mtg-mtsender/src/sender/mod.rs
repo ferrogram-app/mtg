@@ -29,7 +29,7 @@ use crate::net::{NetStream, ServerAddr};
 mod connect;
 mod process;
 
-pub use connect::{connect, connect_with_auth, generate_auth_key};
+pub use connect::{connect, connect_with_auth, generate_auth_key, generate_cdn_auth_key};
 
 /// Every how often are pings sent?
 const PING_DELAY: Duration = Duration::from_secs(60);
