@@ -11,9 +11,16 @@ use crate::Client;
 
 /// A client talking to `server` with the pre-shared key.
 pub(crate) fn client(server: &FakeServer) -> Client {
-    let pool = SenderPool::new(server.session(), 1);
+    client_with(server.session()).0
+}
+
+/// Like [`client`], also returning the client's session to look at what it stored.
+pub(crate) fn client_with(
+    session: std::sync::Arc<mtg_session::storages::MemorySession>,
+) -> (Client, std::sync::Arc<mtg_session::storages::MemorySession>) {
+    let pool = SenderPool::new(session.clone(), 1);
     tokio::spawn(pool.runner.run());
-    Client::new(pool.handle)
+    (Client::new(pool.handle), session)
 }
 
 pub(crate) fn user_ref(id: i64) -> PeerRef {
@@ -82,4 +89,32 @@ pub(crate) fn sent(random_id: i64, msg: tl::enums::Message) -> tl::enums::Update
         date: 0,
         seq: 0,
     })
+}
+
+/// A `dialog` for `peer` whose newest message is `top`; `pts` is set for channels.
+pub(crate) fn dialog(peer: PeerRef, top: i32, pts: Option<i32>) -> tl::enums::Dialog {
+    let mut b = (pts.is_some() as u32).to_le_bytes().to_vec();
+    b.extend(tl::enums::Peer::from(peer.id).to_bytes());
+    b.extend(top.to_le_bytes());
+    for _ in 0..6 {
+        b.extend(0i32.to_le_bytes()); // read marks and unread counters
+    }
+    b.extend(0x99622c0cu32.to_le_bytes()); // peerNotifySettings, no flags
+    b.extend(0u32.to_le_bytes());
+    if let Some(pts) = pts {
+        b.extend(pts.to_le_bytes());
+    }
+    tl::enums::Dialog::Dialog(tl::types::Dialog::from_bytes(&b).unwrap())
+}
+
+/// A broadcast `channel` with an access hash.
+pub(crate) fn channel(id: i64) -> tl::enums::Chat {
+    let mut b = ((1u32 << 13) | (1 << 5)).to_le_bytes().to_vec();
+    b.extend(0u32.to_le_bytes());
+    b.extend(id.to_le_bytes());
+    b.extend((id * 10).to_le_bytes());
+    put_string(&mut b, "title");
+    b.extend(0x37c1011cu32.to_le_bytes()); // chatPhotoEmpty
+    b.extend(0i32.to_le_bytes()); // date
+    tl::enums::Chat::Channel(tl::types::Channel::from_bytes(&b).unwrap())
 }

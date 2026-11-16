@@ -261,3 +261,210 @@ impl Client {
         .map(drop)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use mtg_session::Session;
+    use mtg_session::types::PeerId;
+    use mtg_testkit::FakeServer;
+    use mtg_tl_types as tl;
+
+    use crate::test_util::{
+        channel, channel_ref, chat_ref, client, client_with, dialog, message, user, user_ref,
+    };
+
+    fn dialogs(
+        dialogs: Vec<tl::enums::Dialog>,
+        messages: Vec<tl::enums::Message>,
+        chats: Vec<tl::enums::Chat>,
+        users: Vec<tl::enums::User>,
+        count: Option<i32>,
+    ) -> tl::enums::messages::Dialogs {
+        match count {
+            None => tl::types::messages::Dialogs {
+                dialogs,
+                messages,
+                chats,
+                users,
+            }
+            .into(),
+            Some(count) => tl::types::messages::DialogsSlice {
+                count,
+                dialogs,
+                messages,
+                chats,
+                users,
+            }
+            .into(),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dialogs_are_listed_and_the_channel_pts_is_remembered() {
+        let server = FakeServer::start().await;
+        let (u, ch) = (user_ref(5), channel_ref(9));
+        server.on(move |_: tl::functions::messages::GetDialogs| {
+            Ok(dialogs(
+                vec![dialog(u, 1, None), dialog(ch, 2, Some(77))],
+                vec![message(1, u, "a", 0), message(2, ch, "b", 0)],
+                vec![channel(9)],
+                vec![user(5)],
+                Some(2),
+            ))
+        });
+        let (c, session) = client_with(server.session());
+        let mut it = c.iter_dialogs();
+        assert_eq!(it.total().await.unwrap(), 2);
+        assert_eq!(it.total().await.unwrap(), 2); // cached
+        it.total = None;
+        let mut peers = Vec::new();
+        while let Some(d) = it.next().await.unwrap() {
+            peers.push(d.peer_id());
+        }
+        assert_eq!(
+            peers,
+            [PeerId::user_unchecked(5), PeerId::channel_unchecked(9)]
+        );
+        let state = session.updates_state().await.unwrap();
+        assert!(state.channels.iter().any(|c| c.id == 9 && c.pts == 77));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_full_page_asks_for_the_next_one_after_the_last_message() {
+        let server = FakeServer::start().await;
+        let u = user_ref(5);
+        server.on(move |req: tl::functions::messages::GetDialogs| {
+            Ok(if req.offset_id == 0 {
+                dialogs(
+                    vec![dialog(u, 1, None)],
+                    vec![message(1, u, "a", 0)],
+                    Vec::new(),
+                    vec![user(5)],
+                    Some(9),
+                )
+            } else {
+                assert!(req.exclude_pinned);
+                assert_eq!(req.offset_id, 1);
+                dialogs(Vec::new(), Vec::new(), Vec::new(), Vec::new(), None)
+            })
+        });
+        let mut it = client(&server).iter_dialogs().limit(1);
+        // limit 1 and one dialog: the iterator stops after it without a second request
+        assert!(it.next().await.unwrap().is_some());
+        assert!(it.next().await.unwrap().is_none());
+        // without a limit a one-dialog slice is shorter than a full page: the last one
+        let mut it = client(&server).iter_dialogs();
+        assert!(it.next().await.unwrap().is_some());
+        assert!(it.next().await.unwrap().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn not_modified_dialogs_are_an_error_with_a_count_for_total() {
+        let server = FakeServer::start().await;
+        server.on(|_: tl::functions::messages::GetDialogs| {
+            Ok(tl::types::messages::DialogsNotModified { count: 4 }.into())
+        });
+        let mut it = client(&server).iter_dialogs();
+        assert_eq!(it.total().await.unwrap(), 4);
+        assert!(client(&server).iter_dialogs().next().await.is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn plain_dialogs_are_counted_by_length() {
+        let server = FakeServer::start().await;
+        server.on(|_: tl::functions::messages::GetDialogs| {
+            Ok(dialogs(
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                None,
+            ))
+        });
+        let mut it = client(&server).iter_dialogs();
+        assert_eq!(it.total().await.unwrap(), 0);
+        assert!(
+            client(&server)
+                .iter_dialogs()
+                .next()
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    fn ack() -> tl::enums::messages::AffectedHistory {
+        tl::types::messages::AffectedHistory {
+            pts: 1,
+            pts_count: 1,
+            offset: 0,
+        }
+        .into()
+    }
+
+    fn updates() -> tl::enums::Updates {
+        tl::enums::Updates::TooLong
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn deleting_a_dialog_uses_the_call_of_its_kind() {
+        let server = FakeServer::start().await;
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = |name: &'static str| {
+            let seen = seen.clone();
+            move || seen.lock().unwrap().push(name)
+        };
+        let leave = log("leave");
+        server.on(move |_: tl::functions::channels::LeaveChannel| {
+            leave();
+            Ok(updates())
+        });
+        let kick = log("chat");
+        server.on(move |_: tl::functions::messages::DeleteChatUser| {
+            kick();
+            Ok(updates())
+        });
+        let history = log("history");
+        server.on(move |_: tl::functions::messages::DeleteHistory| {
+            history();
+            Ok(ack())
+        });
+        let c = client(&server);
+        c.delete_dialog(channel_ref(9)).await.unwrap();
+        c.delete_dialog(chat_ref(8)).await.unwrap();
+        c.delete_dialog(user_ref(5)).await.unwrap();
+        assert_eq!(*seen.lock().unwrap(), ["leave", "chat", "history"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reading_and_clearing_mentions() {
+        let server = FakeServer::start().await;
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let s = seen.clone();
+        server.on(move |_: tl::functions::channels::ReadHistory| {
+            s.lock().unwrap().push("channel");
+            Ok(true)
+        });
+        let s = seen.clone();
+        server.on(move |_: tl::functions::messages::ReadHistory| {
+            s.lock().unwrap().push("common");
+            Ok(tl::types::messages::AffectedMessages {
+                pts: 1,
+                pts_count: 1,
+            }
+            .into())
+        });
+        let s = seen.clone();
+        server.on(move |_: tl::functions::messages::ReadMentions| {
+            s.lock().unwrap().push("mentions");
+            Ok(ack())
+        });
+        let c = client(&server);
+        c.mark_as_read(channel_ref(9)).await.unwrap();
+        c.mark_as_read(user_ref(5)).await.unwrap();
+        c.clear_mentions(user_ref(5)).await.unwrap();
+        assert_eq!(*seen.lock().unwrap(), ["channel", "common", "mentions"]);
+    }
+}
