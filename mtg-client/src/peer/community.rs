@@ -104,3 +104,73 @@ impl<'a> From<&'a Community> for PeerInfo {
         <Self as From<&'a tl::types::Community>>::from(&community.raw)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    use mtg_testkit::FakeServer;
+
+    use super::*;
+    use crate::test_util::{channel, chat, client};
+
+    fn forbidden(access_hash: Option<i64>) -> tl::enums::Chat {
+        tl::types::CommunityForbidden {
+            id: 7,
+            access_hash,
+            title: "club".into(),
+        }
+        .into()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn forbidden_community_has_defaults() {
+        let server = FakeServer::start().await;
+        let c = client(&server);
+        let community = Community::from_raw(&c, forbidden(Some(70)));
+        assert_eq!(community.id(), PeerId::channel_unchecked(7));
+        assert_eq!(community.title(), "club");
+        assert!(community.photo().is_none());
+        assert!(community.auth().is_some());
+        let r = community.to_ref().await.unwrap().unwrap();
+        assert_eq!(r.id, community.id());
+        assert!(format!("{community:?}").contains("club"));
+        let info = PeerInfo::from(&community);
+        assert_eq!(PeerInfo::from(community.clone()), info);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn min_or_hashless_community_has_no_auth_and_photo_is_exposed() {
+        let server = FakeServer::start().await;
+        let c = client(&server);
+        let mut community = Community::from_raw(&c, forbidden(Some(70)));
+        community.raw.min = true;
+        assert!(community.auth().is_none());
+        // not in the session cache either
+        assert!(community.to_ref().await.unwrap().is_none());
+
+        let hashless = Community::from_raw(&c, forbidden(None));
+        assert!(hashless.auth().is_none());
+
+        let mut with_photo = Community::from_raw(&c, forbidden(Some(1)));
+        with_photo.raw.photo = tl::types::ChatPhoto {
+            has_video: false,
+            photo_id: 3,
+            stripped_thumb: None,
+            dc_id: 2,
+        }
+        .into();
+        let again = Community::from_raw(&c, tl::enums::Chat::Community(with_photo.raw.clone()));
+        assert_eq!(again.photo().map(|p| p.photo_id), Some(3));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn only_communities_are_accepted() {
+        let server = FakeServer::start().await;
+        let c = client(&server);
+        for raw in [chat(3), channel(9)] {
+            let r = catch_unwind(AssertUnwindSafe(|| Community::from_raw(&c, raw)));
+            assert!(r.is_err());
+        }
+    }
+}

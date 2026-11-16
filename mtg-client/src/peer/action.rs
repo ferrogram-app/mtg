@@ -132,3 +132,91 @@ impl ActionSender {
         (future_output, request_result)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use mtg_testkit::FakeServer;
+
+    use super::*;
+    use crate::test_util::{client, user_ref};
+
+    type Seen = Arc<std::sync::Mutex<Vec<(Option<i32>, bool)>>>;
+
+    fn record(server: &FakeServer) -> Seen {
+        let seen: Seen = Default::default();
+        let log = seen.clone();
+        server.on(move |req: tl::functions::messages::SetTyping| {
+            let cancel = matches!(req.action, SendMessageAction::SendMessageCancelAction);
+            log.lock().unwrap().push((req.top_msg_id, cancel));
+            Ok(true)
+        });
+        seen
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn oneshot_and_cancel_send_set_typing() {
+        let server = FakeServer::start().await;
+        let seen = record(&server);
+        let c = client(&server);
+        let sender = ActionSender::new(&c, user_ref(5)).topic_id(11);
+        sender
+            .oneshot(tl::types::SendMessageTypingAction {})
+            .await
+            .unwrap();
+        sender.cancel().await.unwrap();
+        assert_eq!(*seen.lock().unwrap(), [(Some(11), false), (Some(11), true)]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn repeat_resends_until_the_future_is_done() {
+        let server = FakeServer::start().await;
+        let seen = record(&server);
+        let c = client(&server);
+        let sender = ActionSender::new(&c, user_ref(5)).repeat_delay(Duration::from_millis(20));
+        let built = Arc::new(AtomicUsize::new(0));
+        let counter = built.clone();
+        let work = Box::pin(async {
+            sleep(Duration::from_millis(150)).await;
+            42
+        });
+        let (out, res) = sender
+            .repeat(
+                move || {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    tl::types::SendMessageTypingAction {}
+                },
+                work,
+            )
+            .await;
+        assert_eq!(out, 42);
+        res.unwrap();
+        assert!(built.load(Ordering::SeqCst) >= 2);
+        assert!(seen.lock().unwrap().len() >= 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn repeat_stops_requesting_after_an_error() {
+        let server = FakeServer::start().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let n = calls.clone();
+        server.on(move |_: tl::functions::messages::SetTyping| {
+            n.fetch_add(1, Ordering::SeqCst);
+            Err((400, "PEER_ID_INVALID".to_string()))
+        });
+        let c = client(&server);
+        let sender = ActionSender::new(&c, user_ref(5)).repeat_delay(Duration::from_millis(5));
+        let work = Box::pin(async {
+            sleep(Duration::from_millis(100)).await;
+            1
+        });
+        let (out, res) = sender
+            .repeat(|| tl::types::SendMessageTypingAction {}, work)
+            .await;
+        assert_eq!(out, 1);
+        assert!(matches!(res, Err(InvocationError::Rpc(e)) if e.name == "PEER_ID_INVALID"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+}

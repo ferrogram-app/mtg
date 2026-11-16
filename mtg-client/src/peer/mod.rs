@@ -234,3 +234,161 @@ impl<'a> From<&'a Peer> for PeerInfo {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use mtg_testkit::FakeServer;
+
+    use super::*;
+    use crate::test_util::{channel, chat, client, user};
+
+    fn community(c: &Client, access_hash: Option<i64>, photo: bool) -> tl::enums::Chat {
+        let community = Community::from_raw(
+            c,
+            tl::types::CommunityForbidden {
+                id: 7,
+                access_hash,
+                title: "club".into(),
+            }
+            .into(),
+        );
+        let mut raw = community.raw;
+        if photo {
+            raw.photo = tl::types::ChatPhoto {
+                has_video: false,
+                photo_id: 8,
+                stripped_thumb: None,
+                dc_id: 2,
+            }
+            .into();
+        }
+        tl::enums::Chat::Community(raw)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn from_raw_picks_the_peer_kind() {
+        let server = FakeServer::start().await;
+        let c = client(&server);
+        assert!(matches!(Peer::from_user(&c, user(5)), Peer::User(_)));
+        assert!(matches!(Peer::from_raw(&c, chat(3)), Peer::Group(_)));
+        let tl::enums::Chat::Channel(mut raw) = channel(9) else {
+            unreachable!()
+        };
+        raw.broadcast = true;
+        assert!(matches!(
+            Peer::from_raw(&c, raw.clone().into()),
+            Peer::Channel(_)
+        ));
+        raw.broadcast = false;
+        raw.megagroup = true;
+        assert!(matches!(Peer::from_raw(&c, raw.into()), Peer::Group(_)));
+        let forbidden = |broadcast| {
+            tl::enums::Chat::ChannelForbidden(tl::types::ChannelForbidden {
+                broadcast,
+                megagroup: !broadcast,
+                monoforum: false,
+                id: 4,
+                access_hash: 1,
+                title: "t".into(),
+                until_date: None,
+            })
+        };
+        assert!(matches!(
+            Peer::from_raw(&c, forbidden(true)),
+            Peer::Channel(_)
+        ));
+        assert!(matches!(
+            Peer::from_raw(&c, forbidden(false)),
+            Peer::Group(_)
+        ));
+        assert!(matches!(
+            Peer::from_raw(&c, community(&c, Some(1), false)),
+            Peer::Community(_)
+        ));
+        let forbidden_community: tl::enums::Chat = tl::types::CommunityForbidden {
+            id: 1,
+            access_hash: None,
+            title: "x".into(),
+        }
+        .into();
+        assert!(matches!(
+            Peer::from_raw(&c, forbidden_community),
+            Peer::Community(_)
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn accessors_follow_the_kind() {
+        let server = FakeServer::start().await;
+        let c = client(&server);
+        let u = Peer::from_user(&c, user(5));
+        assert_eq!(u.id(), PeerId::user_unchecked(5));
+        assert!(u.auth().is_some());
+        assert!(u.to_ref().await.unwrap().is_some());
+        assert!(u.username().is_none() && u.usernames().is_empty());
+
+        let g = Peer::from_raw(&c, chat(3));
+        assert_eq!(g.id(), PeerId::chat_unchecked(3));
+        assert!(g.name().is_some());
+        assert!(g.username().is_none() && g.usernames().is_empty());
+        assert!(g.to_ref().await.unwrap().is_some());
+
+        let ch = Peer::from_raw(&c, channel(9));
+        assert_eq!(ch.id(), PeerId::channel_unchecked(9));
+        assert!(ch.name().is_some() && ch.auth().is_some());
+        assert!(ch.to_ref().await.unwrap().is_some());
+        let _ = (ch.username(), ch.usernames());
+
+        let co = Peer::from_raw(&c, community(&c, Some(70), true));
+        assert_eq!((co.name(), co.username()), (Some("club"), None));
+        assert!(co.usernames().is_empty() && co.auth().is_some());
+        assert_eq!(co.id(), PeerId::channel_unchecked(7));
+        assert!(co.to_ref().await.unwrap().is_some());
+
+        for p in [&u, &g, &ch, &co] {
+            assert_eq!(PeerInfo::from(p).id(), p.id());
+        }
+        assert_eq!(PeerInfo::from(co.clone()).id(), co.id());
+        let _ = u.name();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn photo_needs_a_known_peer() {
+        let server = FakeServer::start().await;
+        let c = client(&server);
+        let with = Peer::from_raw(&c, community(&c, Some(70), true));
+        let photo = with.photo(true).await.unwrap().unwrap();
+        assert!(matches!(
+            photo.raw,
+            tl::enums::InputFileLocation::InputPeerPhotoFileLocation(ref l)
+                if l.big && l.photo_id == 8
+        ));
+        // peers without a photo give none for every kind
+        for p in [
+            Peer::from_user(&c, user(5)),
+            Peer::from_raw(&c, chat(3)),
+            Peer::from_raw(&c, channel(9)),
+        ] {
+            let _ = p.photo(false).await.unwrap();
+        }
+        assert!(
+            Peer::from_raw(&c, community(&c, Some(70), false))
+                .photo(false)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // unknown peer: no ref, no photo
+        let mut min = community(&c, Some(70), true);
+        if let tl::enums::Chat::Community(c) = &mut min {
+            c.min = true;
+        }
+        assert!(
+            Peer::from_raw(&c, min)
+                .photo(false)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+}

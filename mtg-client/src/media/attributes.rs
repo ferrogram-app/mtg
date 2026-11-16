@@ -6,7 +6,6 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use std::convert::TryInto;
 use std::time::Duration;
 
 use mtg_tl_types as tl;
@@ -43,14 +42,14 @@ impl From<Attribute> for tl::enums::DocumentAttribute {
                 performer,
             } => Self::Audio(tl::types::DocumentAttributeAudio {
                 voice: false,
-                duration: duration.as_secs().try_into().unwrap(),
+                duration: i32::try_from(duration.as_secs()).unwrap_or(i32::MAX),
                 title,
                 performer,
                 waveform: None,
             }),
             Voice { duration, waveform } => Self::Audio(tl::types::DocumentAttributeAudio {
                 voice: true,
-                duration: duration.as_secs().try_into().unwrap(),
+                duration: i32::try_from(duration.as_secs()).unwrap_or(i32::MAX),
                 title: None,
                 performer: None,
                 waveform,
@@ -76,5 +75,55 @@ impl From<Attribute> for tl::enums::DocumentAttribute {
                 Self::Filename(tl::types::DocumentAttributeFilename { file_name })
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    type Da = tl::enums::DocumentAttribute;
+
+    #[test]
+    fn audio_and_voice() {
+        let a: Da = Attribute::Audio {
+            duration: Duration::from_secs(7),
+            title: Some("t".into()),
+            performer: Some("p".into()),
+        }
+        .into();
+        let Da::Audio(a) = a else { panic!("not audio") };
+        assert!(!a.voice && a.duration == 7);
+        assert_eq!(
+            (a.title.as_deref(), a.performer.as_deref()),
+            (Some("t"), Some("p"))
+        );
+
+        let v: Da = Attribute::Voice {
+            duration: Duration::from_secs(u64::MAX),
+            waveform: Some(vec![1, 2]),
+        }
+        .into();
+        let Da::Audio(v) = v else { panic!("not voice") };
+        // an absurd duration saturates instead of panicking
+        assert!(v.voice && v.duration == i32::MAX && v.waveform == Some(vec![1, 2]));
+    }
+
+    #[test]
+    fn video_and_file_name() {
+        let v: Da = Attribute::Video {
+            round_message: true,
+            supports_streaming: true,
+            duration: Duration::from_millis(1500),
+            w: 3,
+            h: 4,
+        }
+        .into();
+        let Da::Video(v) = v else { panic!("not video") };
+        assert!(v.round_message && v.supports_streaming && !v.nosound);
+        assert_eq!((v.duration, v.w, v.h), (1.5, 3, 4));
+
+        let f: Da = Attribute::FileName("a.txt".into()).into();
+        assert!(matches!(f, Da::Filename(f) if f.file_name == "a.txt"));
     }
 }

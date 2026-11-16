@@ -250,6 +250,11 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
+    use mtg_testkit::FakeServer;
+    use mtg_tl_types::Deserializable;
+
+    use crate::test_util::{channel, client, user};
+
     fn empty_peers() -> PeerMap {
         PeerMap {
             map: Arc::new(HashMap::new()),
@@ -274,5 +279,260 @@ mod tests {
         }
         .into();
         assert!(Participant::from_raw_channel(&mut peers, channel).is_none());
+    }
+
+    fn admin_rights() -> tl::enums::ChatAdminRights {
+        tl::types::ChatAdminRights::from_bytes(&0u32.to_le_bytes())
+            .unwrap()
+            .into()
+    }
+
+    fn banned_rights() -> tl::enums::ChatBannedRights {
+        let mut b = 0u32.to_le_bytes().to_vec();
+        b.extend(0i32.to_le_bytes());
+        tl::types::ChatBannedRights::from_bytes(&b).unwrap().into()
+    }
+
+    fn user_peer(id: i64) -> tl::enums::Peer {
+        tl::types::PeerUser { user_id: id }.into()
+    }
+
+    async fn map(c: &crate::Client) -> PeerMap {
+        c.build_peer_map(vec![user(5)], vec![channel(9)]).await
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn channel_participants_keep_their_roles() {
+        let server = FakeServer::start().await;
+        let c = client(&server);
+
+        let mut peers = map(&c).await;
+        let p = Participant::from_raw_channel(
+            &mut peers,
+            tl::types::ChannelParticipant {
+                user_id: 5,
+                date: 7,
+                subscription_until_date: None,
+                rank: None,
+            }
+            .into(),
+        )
+        .unwrap();
+        let Role::User(n) = &p.role else {
+            panic!("not a user")
+        };
+        assert_eq!((n.date(), n.inviter_id()), (utils::date(7), None));
+        assert_eq!(p.user.id(), PeerId::user_unchecked(5));
+
+        let mut peers = map(&c).await;
+        let p = Participant::from_raw_channel(
+            &mut peers,
+            tl::types::ChannelParticipantSelf {
+                via_request: false,
+                user_id: 5,
+                inviter_id: 6,
+                date: 1,
+                subscription_until_date: None,
+                rank: None,
+            }
+            .into(),
+        )
+        .unwrap();
+        assert!(
+            matches!(&p.role, Role::User(n) if n.inviter_id() == Some(PeerId::user_unchecked(6)))
+        );
+
+        let mut peers = map(&c).await;
+        let p = Participant::from_raw_channel(
+            &mut peers,
+            tl::types::ChannelParticipantCreator {
+                user_id: 5,
+                admin_rights: admin_rights(),
+                rank: Some("boss".into()),
+            }
+            .into(),
+        )
+        .unwrap();
+        let Role::Creator(cr) = &p.role else {
+            panic!("not a creator")
+        };
+        assert_eq!(cr.rank(), Some("boss"));
+        let _ = cr.permissions();
+
+        let mut peers = map(&c).await;
+        let p = Participant::from_raw_channel(
+            &mut peers,
+            tl::types::ChannelParticipantAdmin {
+                can_edit: true,
+                is_self: false,
+                user_id: 5,
+                inviter_id: Some(6),
+                promoted_by: 8,
+                date: 2,
+                admin_rights: admin_rights(),
+                rank: Some("mod".into()),
+            }
+            .into(),
+        )
+        .unwrap();
+        let Role::Admin(a) = &p.role else {
+            panic!("not an admin")
+        };
+        assert!(a.can_edit());
+        assert_eq!(a.inviter_id(), Some(PeerId::user_unchecked(6)));
+        assert_eq!(a.promoted_by(), Some(PeerId::user_unchecked(8)));
+        assert_eq!((a.date(), a.rank()), (utils::date(2), Some("mod")));
+        let _ = a.permissions();
+
+        let mut peers = map(&c).await;
+        let p = Participant::from_raw_channel(
+            &mut peers,
+            tl::types::ChannelParticipantBanned {
+                left: true,
+                peer: user_peer(5),
+                kicked_by: 8,
+                date: 3,
+                banned_rights: banned_rights(),
+                rank: None,
+            }
+            .into(),
+        )
+        .unwrap();
+        let Role::Banned(b) = &p.role else {
+            panic!("not banned")
+        };
+        assert!(b.left());
+        assert_eq!(
+            (b.kicked_by(), b.date()),
+            (PeerId::user_unchecked(8), utils::date(3))
+        );
+        let _ = b.restrictions();
+
+        let mut peers = map(&c).await;
+        let p = Participant::from_raw_channel(
+            &mut peers,
+            tl::types::ChannelParticipantLeft { peer: user_peer(5) }.into(),
+        )
+        .unwrap();
+        assert_eq!(p.role, Role::Left(Left {}));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn non_user_or_unknown_participants_are_skipped() {
+        let server = FakeServer::start().await;
+        let c = client(&server);
+        let channel_peer: tl::enums::Peer = tl::types::PeerChannel { channel_id: 9 }.into();
+
+        let mut peers = map(&c).await;
+        let banned = tl::types::ChannelParticipantBanned {
+            left: false,
+            peer: channel_peer.clone(),
+            kicked_by: 8,
+            date: 3,
+            banned_rights: banned_rights(),
+            rank: None,
+        };
+        assert!(Participant::from_raw_channel(&mut peers, banned.clone().into()).is_none());
+        let mut peers = map(&c).await;
+        let mut unknown = banned;
+        unknown.peer = user_peer(77);
+        assert!(Participant::from_raw_channel(&mut peers, unknown.into()).is_none());
+
+        let mut peers = map(&c).await;
+        let left: tl::enums::ChannelParticipant =
+            tl::types::ChannelParticipantLeft { peer: channel_peer }.into();
+        assert!(Participant::from_raw_channel(&mut peers, left).is_none());
+        let mut peers = map(&c).await;
+        let left: tl::enums::ChannelParticipant = tl::types::ChannelParticipantLeft {
+            peer: user_peer(77),
+        }
+        .into();
+        assert!(Participant::from_raw_channel(&mut peers, left).is_none());
+
+        // a channel id given as a user id does not resolve to a user
+        let mut peers = map(&c).await;
+        let plain: tl::enums::ChannelParticipant = tl::types::ChannelParticipant {
+            user_id: 77,
+            date: 0,
+            subscription_until_date: None,
+            rank: None,
+        }
+        .into();
+        assert!(Participant::from_raw_channel(&mut peers, plain).is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn chat_participants() {
+        let server = FakeServer::start().await;
+        let c = client(&server);
+
+        let mut peers = map(&c).await;
+        let p = Participant::from_raw_chat(
+            &mut peers,
+            tl::types::ChatParticipant {
+                user_id: 5,
+                inviter_id: 6,
+                date: 1,
+                rank: None,
+            }
+            .into(),
+        )
+        .unwrap();
+        assert!(
+            matches!(&p.role, Role::User(n) if n.inviter_id() == Some(PeerId::user_unchecked(6)))
+        );
+
+        let mut peers = map(&c).await;
+        let p = Participant::from_raw_chat(
+            &mut peers,
+            tl::types::ChatParticipantCreator {
+                user_id: 5,
+                rank: None,
+            }
+            .into(),
+        )
+        .unwrap();
+        assert!(matches!(&p.role, Role::Creator(cr) if cr.rank().is_none()));
+
+        let mut peers = map(&c).await;
+        let p = Participant::from_raw_chat(
+            &mut peers,
+            tl::types::ChatParticipantAdmin {
+                user_id: 5,
+                inviter_id: 6,
+                date: 4,
+                rank: None,
+            }
+            .into(),
+        )
+        .unwrap();
+        assert!(matches!(&p.role, Role::Admin(a) if a.can_edit() && a.promoted_by().is_none()));
+
+        let mut peers = map(&c).await;
+        assert!(
+            Participant::from_raw_chat(
+                &mut peers,
+                tl::types::ChatParticipantCreator {
+                    user_id: 77,
+                    rank: None
+                }
+                .into()
+            )
+            .is_none()
+        );
+        let mut peers = map(&c).await;
+        assert!(
+            Participant::from_raw_chat(
+                &mut peers,
+                tl::types::ChatParticipantAdmin {
+                    user_id: 77,
+                    inviter_id: 6,
+                    date: 4,
+                    rank: None
+                }
+                .into()
+            )
+            .is_none()
+        );
     }
 }

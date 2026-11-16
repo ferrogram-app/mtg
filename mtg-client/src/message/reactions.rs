@@ -83,3 +83,28 @@ impl From<InputReactions> for Vec<Reaction> {
         val.reactions
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builders_and_conversions() {
+        let r = InputReactions::emoticon("👍").big().add_to_recent();
+        assert!(r.big && r.add_to_recent);
+        let v: Vec<Reaction> = r.into();
+        assert!(matches!(&v[..], [Reaction::Emoji(e)] if e.emoticon == "👍"));
+
+        let v: Vec<Reaction> = InputReactions::custom_emoji(5).into();
+        assert!(matches!(&v[..], [Reaction::CustomEmoji(c)] if c.document_id == 5));
+
+        assert!(Vec::<Reaction>::from(InputReactions::remove()).is_empty());
+
+        let from_str: Vec<Reaction> = InputReactions::from("x").into();
+        let from_string: Vec<Reaction> = InputReactions::from(String::from("x")).into();
+        assert_eq!(from_str.len() + from_string.len(), 2);
+
+        let r = InputReactions::from(vec![Reaction::Empty]);
+        assert!(!r.big && !r.add_to_recent && r.reactions.len() == 1);
+    }
+}
