@@ -399,6 +399,15 @@ async fn receiver(
             is_self: Some(true),
         },
     );
+    // a channel whose access hash we know (100) and one we do not (200: nothing stored)
+    data.peer_infos.insert(
+        PeerId::channel_unchecked(100),
+        PeerInfo::Channel {
+            id: 100,
+            auth: Some(mtg_session::types::PeerAuth::from_hash(55)),
+            kind: None,
+        },
+    );
     let session = std::sync::Arc::new(MemorySession::from(data));
     let pool = SenderPool::new(session.clone(), 1);
     tokio::spawn(pool.runner.run());
@@ -713,5 +722,83 @@ async fn a_cdn_dc_without_a_key_or_a_public_key_is_not_connected() {
         })],
     }));
     assert!(handle.invoke_in_dc(203, &get_cdn_file()).await.is_err());
+    handle.quit();
+}
+
+fn channel_too_long(channel_id: i64, pts: i32) -> mtg_session::updates::UpdatesLike {
+    mtg_session::updates::UpdatesLike::Updates(tl::enums::Updates::Updates(tl::types::Updates {
+        updates: vec![
+            tl::types::UpdateChannelTooLong {
+                channel_id,
+                pts: Some(pts),
+            }
+            .into(),
+        ],
+        users: Vec::new(),
+        chats: Vec::new(),
+        date: 0,
+        seq: 0,
+    }))
+}
+
+fn channel_difference(r#final: bool, pts: i32) -> tl::enums::updates::ChannelDifference {
+    tl::enums::updates::ChannelDifference::Empty(tl::types::updates::ChannelDifferenceEmpty {
+        r#final,
+        pts,
+        timeout: None,
+    })
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_channel_difference_that_is_not_final_is_asked_again_from_its_pts() {
+    let server = FakeServer::start().await;
+    server
+        .on(|_: tl::functions::updates::GetState| Ok(tl::enums::updates::State::State(state(10))));
+    let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = asked.clone();
+    let answers = std::sync::Mutex::new(
+        vec![channel_difference(false, 30), channel_difference(true, 40)].into_iter(),
+    );
+    server.on(move |r: tl::functions::updates::GetChannelDifference| {
+        let tl::enums::InputChannel::Channel(c) = &r.channel else {
+            panic!("not a channel")
+        };
+        seen.lock()
+            .unwrap()
+            .push((c.channel_id, c.access_hash, r.pts));
+        Ok(answers
+            .lock()
+            .unwrap()
+            .next()
+            .unwrap_or_else(|| channel_difference(true, 40)))
+    });
+    let (handle, mut receiver, feed) = receiver(&server).await;
+    feed.send(channel_too_long(100, 20)).await.unwrap();
+    for _ in 0..4 {
+        poll(&mut receiver).await;
+    }
+    let asked = asked.lock().unwrap().clone();
+    assert_eq!(asked.len(), 2, "{asked:?}");
+    assert_eq!(asked[0].1, 55);
+    // the second request continues from the pts of the first answer
+    assert_eq!(asked[1].2, 30);
+    handle.quit();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_channel_without_a_stored_hash_is_dropped_without_a_request() {
+    let server = FakeServer::start().await;
+    server
+        .on(|_: tl::functions::updates::GetState| Ok(tl::enums::updates::State::State(state(10))));
+    let (handle, mut receiver, feed) = receiver(&server).await;
+    feed.send(channel_too_long(200, 20)).await.unwrap();
+    for _ in 0..2 {
+        poll(&mut receiver).await;
+    }
+    assert!(
+        !server.requests().contains(&"GetChannelDifference"),
+        "{:?}",
+        server.requests()
+    );
     handle.quit();
 }
