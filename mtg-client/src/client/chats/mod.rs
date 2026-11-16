@@ -650,4 +650,134 @@ mod tests {
         // ban with view_messages off for a moment, then lift it
         assert_eq!(*seen.lock().unwrap(), ["ban", "ban", "delete"]);
     }
+
+    fn full_chat(participants: Vec<tl::enums::ChatParticipant>) -> tl::enums::messages::ChatFull {
+        use mtg_tl_types::Deserializable;
+        let notify = tl::types::PeerNotifySettings::from_bytes(&0u32.to_le_bytes()).unwrap();
+        tl::enums::messages::ChatFull::Full(tl::types::messages::ChatFull {
+            full_chat: tl::enums::ChatFull::Full(tl::types::ChatFull {
+                can_set_username: false,
+                has_scheduled: false,
+                translations_disabled: false,
+                has_welcome_messages: false,
+                id: 3,
+                about: String::new(),
+                participants: tl::types::ChatParticipants {
+                    chat_id: 3,
+                    participants,
+                    version: 1,
+                }
+                .into(),
+                chat_photo: None,
+                notify_settings: notify.into(),
+                exported_invite: None,
+                bot_info: None,
+                pinned_msg_id: None,
+                folder_id: None,
+                call: None,
+                ttl_period: None,
+                groupcall_default_join_as: None,
+                theme_emoticon: None,
+                requests_pending: None,
+                recent_requesters: None,
+                available_reactions: None,
+                reactions_limit: None,
+            }),
+            chats: Vec::new(),
+            users: Vec::new(),
+        })
+    }
+
+    fn member(user_id: i64) -> tl::enums::ChatParticipant {
+        tl::types::ChatParticipantCreator {
+            user_id,
+            rank: None,
+        }
+        .into()
+    }
+
+    #[test]
+    fn only_updates_with_chats_give_a_chat() {
+        let server = tokio::runtime::Runtime::new().unwrap();
+        let (c, _server) = server.block_on(async {
+            let s = FakeServer::start().await;
+            (client(&s), s)
+        });
+        let with = |chats: Vec<tl::enums::Chat>| {
+            tl::enums::Updates::Updates(tl::types::Updates {
+                updates: Vec::new(),
+                users: Vec::new(),
+                chats,
+                date: 0,
+                seq: 0,
+            })
+        };
+        let combined = tl::enums::Updates::Combined(tl::types::UpdatesCombined {
+            updates: Vec::new(),
+            users: Vec::new(),
+            chats: vec![chat(3)],
+            date: 0,
+            seq_start: 0,
+            seq: 0,
+        });
+        assert!(super::updates_to_chat(&c, Some(3), combined).is_some());
+        assert!(super::updates_to_chat(&c, None, with(vec![chat(4)])).is_some());
+        assert!(super::updates_to_chat(&c, Some(5), with(vec![chat(4)])).is_none());
+        assert!(super::updates_to_chat(&c, None, with(vec![])).is_none());
+        assert!(super::updates_to_chat(&c, None, tl::enums::Updates::TooLong).is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn permissions_in_a_basic_group_come_from_its_participant_list() {
+        let server = FakeServer::start().await;
+        server.on(|_: tl::functions::messages::GetFullChat| Ok(full_chat(vec![member(5)])));
+        server.on(|_: tl::functions::users::GetUsers| Ok(vec![user(6)]));
+        let c = client(&server);
+        let p = c.get_permissions(chat_ref(3), user_ref(5)).await.unwrap();
+        assert!(p.is_creator());
+        // not a member
+        let err = c
+            .get_permissions(chat_ref(3), user_ref(7))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, mtg_mtsender::InvocationError::Rpc(e) if e.name == "USER_NOT_PARTICIPANT")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn permissions_of_the_current_user_resolve_through_get_me() {
+        let server = FakeServer::start().await;
+        server.on(|_: tl::functions::messages::GetFullChat| Ok(full_chat(vec![member(5)])));
+        server.on(|_: tl::functions::users::GetUsers| Ok(vec![user(5)]));
+        let c = client(&server);
+        let self_ref = mtg_session::types::PeerRef {
+            id: mtg_session::types::PeerId::self_user(),
+            auth: Default::default(),
+        };
+        let p = c.get_permissions(chat_ref(3), self_ref).await.unwrap();
+        assert!(p.is_creator());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn permissions_in_a_channel_come_from_get_participant() {
+        let server = FakeServer::start().await;
+        server.on(|_: tl::functions::channels::GetParticipant| {
+            Ok(tl::enums::channels::ChannelParticipant::Participant(
+                tl::types::channels::ChannelParticipant {
+                    participant: tl::types::ChannelParticipantLeft {
+                        peer: tl::types::PeerUser { user_id: 5 }.into(),
+                    }
+                    .into(),
+                    chats: Vec::new(),
+                    users: Vec::new(),
+                },
+            ))
+        });
+        let p = client(&server)
+            .get_permissions(channel_ref(9), user_ref(5))
+            .await
+            .unwrap();
+        assert!(p.has_left());
+    }
 }
