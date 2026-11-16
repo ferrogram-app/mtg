@@ -189,3 +189,51 @@ keyboardButtonGame#50f41ccf text:string = KeyboardButton;
 keyboardButtonBuy#afd93fbb text:string = KeyboardButton;
 inputKeyboardButtonUrlAuth#d02e7fd4 flags:# request_write_access:flags.0?true text:string fwd_text:flags.1?string url:string bot:InputUser = KeyboardButton;
 */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tl::enums::{ButtonType as K, InlineButtonType as B};
+
+    fn inline(b: Button) -> (String, B) {
+        let tl::enums::KeyboardInlineButton::Button(b) = b.raw;
+        (b.text, b.r#type)
+    }
+
+    fn key(k: Key) -> (String, K) {
+        let tl::enums::KeyboardButton::Button(k) = k.raw;
+        (k.text, k.r#type)
+    }
+
+    #[test]
+    fn inline_buttons_carry_their_payload() {
+        let (t, ty) = inline(Button::data("d", "x"));
+        assert!(matches!(&ty, B::Callback(c) if c.data == b"x" && !c.requires_password));
+        assert_eq!(t, "d");
+        assert!(
+            matches!(inline(Button::switch("s", "q")).1, B::SwitchInline(s) if s.same_peer && s.query == "q")
+        );
+        assert!(matches!(
+            inline(Button::switch_elsewhere("s", "q")).1,
+            B::SwitchInline(s) if !s.same_peer && s.query == "q"
+        ));
+        assert!(
+            matches!(inline(Button::url("u", "https://a")).1, B::Url(u) if u.url == "https://a")
+        );
+        assert!(
+            matches!(inline(Button::webview("w", "https://b")).1, B::WebView(w) if w.url == "https://b")
+        );
+    }
+
+    #[test]
+    fn keyboard_keys_have_their_kind() {
+        assert!(matches!(key(Key::text("a")).1, K::Default));
+        assert!(matches!(key(Key::request_phone("a")).1, K::RequestPhone));
+        assert!(matches!(
+            key(Key::request_geo("a")).1,
+            K::RequestGeoLocation
+        ));
+        assert!(matches!(key(Key::request_poll("a")).1, K::RequestPoll(p) if p.quiz.is_none()));
+        assert!(matches!(key(Key::request_quiz("a")).1, K::RequestPoll(p) if p.quiz == Some(true)));
+    }
+}

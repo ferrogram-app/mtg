@@ -292,3 +292,102 @@ impl ReplyMarkup {
         self
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tl::enums::ReplyMarkup as RM;
+
+    fn buttons() -> Vec<Button> {
+        vec![Button::data("a", "1"), Button::data("b", "2")]
+    }
+
+    fn keys() -> Vec<Key> {
+        vec![Key::text("a"), Key::text("b")]
+    }
+
+    fn inline_rows(m: ReplyMarkup) -> Vec<usize> {
+        let RM::ReplyInlineMarkup(m) = m.raw else {
+            panic!("not inline")
+        };
+        m.rows
+            .into_iter()
+            .map(|tl::enums::KeyboardInlineButtonRow::Row(r)| r.buttons.len())
+            .collect()
+    }
+
+    fn key_rows(m: &ReplyMarkup) -> Vec<usize> {
+        let RM::ReplyKeyboardMarkup(m) = &m.raw else {
+            panic!("not a keyboard")
+        };
+        m.rows
+            .iter()
+            .map(|tl::enums::KeyboardButtonRow::Row(r)| r.buttons.len())
+            .collect()
+    }
+
+    #[test]
+    fn inline_markups_are_laid_out_as_asked() {
+        assert_eq!(
+            inline_rows(ReplyMarkup::from_buttons(&[
+                buttons(),
+                buttons().into_iter().take(1).collect()
+            ])),
+            [2, 1]
+        );
+        assert_eq!(inline_rows(ReplyMarkup::from_buttons_row(&buttons())), [2]);
+        assert_eq!(
+            inline_rows(ReplyMarkup::from_buttons_col(&buttons())),
+            [1, 1]
+        );
+    }
+
+    #[test]
+    fn keyboards_are_laid_out_as_asked() {
+        assert_eq!(
+            key_rows(&ReplyMarkup::from_keys(&[
+                keys(),
+                keys().into_iter().take(1).collect()
+            ])),
+            [2, 1]
+        );
+        assert_eq!(key_rows(&ReplyMarkup::from_keys_row(&keys())), [2]);
+        assert_eq!(key_rows(&ReplyMarkup::from_keys_col(&keys())), [1, 1]);
+    }
+
+    #[test]
+    fn flags_apply_only_where_they_exist() {
+        let RM::ReplyKeyboardMarkup(k) = ReplyMarkup::from_keys_row(&keys())
+            .fit_size()
+            .single_use()
+            .selective()
+            .raw
+        else {
+            panic!()
+        };
+        assert!(k.resize && k.single_use && k.selective);
+
+        let RM::ReplyKeyboardForceReply(f) = ReplyMarkup::force_reply()
+            .single_use()
+            .selective()
+            .fit_size()
+            .raw
+        else {
+            panic!()
+        };
+        assert!(f.single_use && f.selective);
+
+        let RM::ReplyKeyboardHide(h) = ReplyMarkup::hide().single_use().selective().fit_size().raw
+        else {
+            panic!()
+        };
+        assert!(h.selective);
+
+        // an inline markup ignores all three
+        let m = ReplyMarkup::from_buttons_row(&buttons())
+            .fit_size()
+            .single_use()
+            .selective();
+        assert_eq!(inline_rows(m), [2]);
+    }
+}
