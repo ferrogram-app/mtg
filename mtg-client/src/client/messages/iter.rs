@@ -414,3 +414,208 @@ impl GlobalSearchIter {
         Ok(self.pop_item())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use mtg_session::types::PeerRef;
+    use mtg_testkit::FakeServer;
+    use mtg_tl_types as tl;
+
+    use crate::test_util::{client, message, user_ref};
+
+    type Msgs = tl::enums::messages::Messages;
+
+    fn plain(messages: Vec<tl::enums::Message>) -> Msgs {
+        tl::types::messages::Messages {
+            messages,
+            topics: Vec::new(),
+            chats: Vec::new(),
+            users: Vec::new(),
+        }
+        .into()
+    }
+
+    fn slice(count: i32, next_rate: Option<i32>, messages: Vec<tl::enums::Message>) -> Msgs {
+        tl::types::messages::MessagesSlice {
+            inexact: false,
+            count,
+            next_rate,
+            offset_id_offset: None,
+            search_flood: None,
+            messages,
+            topics: Vec::new(),
+            chats: Vec::new(),
+            users: Vec::new(),
+        }
+        .into()
+    }
+
+    fn channel(count: i32, messages: Vec<tl::enums::Message>) -> Msgs {
+        tl::types::messages::ChannelMessages {
+            inexact: false,
+            pts: 1,
+            count,
+            offset_id_offset: None,
+            messages,
+            topics: Vec::new(),
+            chats: Vec::new(),
+            users: Vec::new(),
+        }
+        .into()
+    }
+
+    fn msgs(peer: PeerRef, ids: &[i32]) -> Vec<tl::enums::Message> {
+        ids.iter().map(|&i| message(i, peer, "m", 0)).collect()
+    }
+
+    fn not_modified() -> Msgs {
+        tl::types::messages::MessagesNotModified { count: 0 }.into()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn history_is_read_page_by_page_until_the_oldest() {
+        let server = FakeServer::start().await;
+        let peer = user_ref(5);
+        server.on(move |req: tl::functions::messages::GetHistory| {
+            Ok(match req.offset_id {
+                0 => slice(300, None, msgs(peer, &[250, 249])),
+                249 => slice(300, None, msgs(peer, &[2])), // 2 <= limit: nothing older
+                other => panic!("unexpected offset {other}"),
+            })
+        });
+        let mut it = client(&server).iter_messages(peer);
+        assert_eq!(it.total().await.unwrap(), 300);
+        let mut ids = Vec::new();
+        while let Some(m) = it.next().await.unwrap() {
+            ids.push(m.id());
+        }
+        assert_eq!(ids, [250, 249, 2]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_limit_stops_the_history_and_offsets_are_passed() {
+        let server = FakeServer::start().await;
+        let peer = user_ref(5);
+        server.on(move |req: tl::functions::messages::GetHistory| {
+            assert_eq!((req.offset_id, req.offset_date, req.limit), (900, 77, 1));
+            Ok(channel(1000, msgs(peer, &[899])))
+        });
+        let mut it = client(&server)
+            .iter_messages(peer)
+            .offset_id(900)
+            .offset_date(77)
+            .limit(1);
+        assert_eq!(it.next().await.unwrap().unwrap().id(), 899);
+        assert!(it.next().await.unwrap().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn history_can_be_read_oldest_first() {
+        let server = FakeServer::start().await;
+        let peer = user_ref(5);
+        server.on(move |req: tl::functions::messages::GetHistory| {
+            assert_eq!((req.offset_id, req.add_offset), (1, -req.limit + 1));
+            Ok(plain(msgs(peer, &[3, 2, 1])))
+        });
+        let mut it = client(&server).iter_messages(peer).reverse(true);
+        let mut ids = Vec::new();
+        while let Some(m) = it.next().await.unwrap() {
+            ids.push(m.id());
+        }
+        assert_eq!(ids, [1, 2, 3]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reverse_with_an_offset_continues_from_it() {
+        let server = FakeServer::start().await;
+        let peer = user_ref(5);
+        server.on(move |req: tl::functions::messages::GetHistory| {
+            assert_eq!((req.min_id, req.add_offset), (40, -req.limit));
+            Ok(plain(Vec::new()))
+        });
+        let mut it = client(&server)
+            .iter_messages(peer)
+            .reverse(true)
+            .offset_id(40);
+        assert!(it.next().await.unwrap().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn not_modified_is_an_error_and_total_counts_plain_lists() {
+        let server = FakeServer::start().await;
+        let peer = user_ref(5);
+        server.on(|_: tl::functions::messages::GetHistory| Ok(not_modified()));
+        let mut it = client(&server).iter_messages(peer);
+        assert!(it.next().await.is_err());
+        assert_eq!(it.total().await.unwrap(), 0); // NotModified carries its own count
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn searching_a_chat_passes_the_options_and_pages() {
+        let server = FakeServer::start().await;
+        let peer = user_ref(5);
+        server.on(move |req: tl::functions::messages::Search| {
+            if req.limit == 0 {
+                return Ok(plain(msgs(peer, &[1, 2, 3, 4])));
+            }
+            assert_eq!(req.q, "needle");
+            assert!(matches!(req.from_id, Some(tl::enums::InputPeer::PeerSelf)));
+            // the first page uses our dates; later ones move max_date to the last message
+            assert_eq!(req.min_date, 10);
+            assert_eq!(req.max_date, if req.offset_id == 5 { 20 } else { 100 });
+            assert!(matches!(
+                req.filter,
+                tl::enums::MessagesFilter::InputMessagesFilterPhotos
+            ));
+            Ok(match req.offset_id {
+                5 => slice(1000, None, msgs(peer, &[400, 399])),
+                399 => slice(1000, None, Vec::new()),
+                other => panic!("unexpected offset {other}"),
+            })
+        });
+        let ts = |s| jiff::Timestamp::from_second(s).unwrap();
+        let mut it = client(&server)
+            .search_messages(peer)
+            .query("needle")
+            .sent_by_self()
+            .min_date(ts(10))
+            .max_date(ts(20))
+            .filter(tl::enums::MessagesFilter::InputMessagesFilterPhotos)
+            .offset_id(5);
+        assert_eq!(it.total().await.unwrap(), 4);
+        it.total = None;
+        let mut ids = Vec::new();
+        while let Some(m) = it.next().await.unwrap() {
+            ids.push(m.id());
+        }
+        assert_eq!(ids, [400, 399]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn searching_everywhere_follows_the_rate_and_the_last_peer() {
+        let server = FakeServer::start().await;
+        let peer = user_ref(5);
+        server.on(move |req: tl::functions::messages::SearchGlobal| {
+            assert_eq!(req.q, "q");
+            Ok(match req.offset_id {
+                0 => slice(2, Some(55), msgs(peer, &[10])),
+                10 => {
+                    assert_eq!(req.offset_rate, 55);
+                    assert!(!matches!(req.offset_peer, tl::enums::InputPeer::Empty));
+                    slice(2, None, msgs(peer, &[9]))
+                }
+                other => panic!("unexpected offset {other}"),
+            })
+        });
+        let c = client(&server);
+        let mut total = c
+            .search_all_messages()
+            .query("q")
+            .filter(tl::enums::MessagesFilter::InputMessagesFilterEmpty);
+        assert_eq!(total.total().await.unwrap(), 2);
+        // No stored peer for the offset: it falls back to the empty one.
+        let mut it = c.search_all_messages().query("q").offset_id(0).limit(1);
+        assert_eq!(it.next().await.unwrap().unwrap().id(), 10);
+        assert!(it.next().await.unwrap().is_none());
+    }
+}
