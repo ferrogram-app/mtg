@@ -141,9 +141,12 @@ impl UpdatesReceiver {
                         .await?;
                     self.message_box.set_state(state);
                 }
-                Err(_err) => {
-                    // The account may no longer actually be logged in, or it can rarely fail.
-                    // `message_box` will try to correct its state as updates arrive.
+                Err(err) => {
+                    // Rarely it fails (network, flood): ask again on the next call. A logged-out
+                    // account (401) will not get better, so that one is not repeated.
+                    // `message_box` corrects its state as updates arrive meanwhile.
+                    self.should_get_state =
+                        !matches!(&err, InvocationError::Rpc(e) if e.code == 401);
                 }
             }
         }

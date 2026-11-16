@@ -362,3 +362,108 @@ async fn dead_media_addresses_fall_back_to_the_ordinary_connection() {
     assert_eq!(server.connections(), 1);
     handle.quit();
 }
+
+async fn receiver(
+    server: &FakeServer,
+) -> (
+    mtg_mtsender::SenderPoolFatHandle,
+    mtg_mtsender::UpdatesReceiver,
+) {
+    use mtg_session::SessionData;
+    use mtg_session::storages::{MemorySession, erase};
+    use mtg_session::types::{DcOption, PeerId, PeerInfo};
+    let std::net::SocketAddr::V4(ipv4) = server.addr else {
+        unreachable!()
+    };
+    let mut data = SessionData {
+        home_dc: 2,
+        ..Default::default()
+    };
+    data.dc_options.insert(
+        2,
+        DcOption {
+            id: 2,
+            ipv4,
+            ipv6: "[::1]:1".parse().unwrap(),
+            auth_key: Some(mtg_testkit::KEY),
+        },
+    );
+    // MemorySession does not alias the account to `self_user` (SQLite does), so put it there
+    data.peer_infos.insert(
+        PeerId::self_user(),
+        PeerInfo::User {
+            id: 1,
+            auth: None,
+            bot: Some(false),
+            is_self: Some(true),
+        },
+    );
+    let session = std::sync::Arc::new(MemorySession::from(data));
+    let pool = SenderPool::new(session.clone(), 1);
+    tokio::spawn(pool.runner.run());
+    let receiver = mtg_mtsender::UpdatesReceiver::create(
+        pool.handle.thin.clone(),
+        erase(session),
+        pool.updates,
+        Default::default(),
+    )
+    .await
+    .unwrap();
+    (pool.handle, receiver)
+}
+
+async fn poll(receiver: &mut mtg_mtsender::UpdatesReceiver) {
+    // no updates ever arrive: next() runs getState and then waits
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(500), receiver.next()).await;
+}
+
+fn state_count(server: &FakeServer) -> usize {
+    server
+        .requests()
+        .iter()
+        .filter(|r| **r == "GetState")
+        .count()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_get_state_is_asked_again_on_the_next_call() {
+    let server = FakeServer::start().await;
+    server.on(|_: tl::functions::updates::GetState| Err((500, "INTERNAL".into())));
+    let (handle, mut receiver) = receiver(&server).await;
+    poll(&mut receiver).await;
+    poll(&mut receiver).await;
+    assert!(state_count(&server) >= 2, "{:?}", server.requests());
+    handle.quit();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_logged_out_account_does_not_repeat_get_state() {
+    let server = FakeServer::start().await;
+    server.on(|_: tl::functions::updates::GetState| Err((401, "AUTH_KEY_UNREGISTERED".into())));
+    let (handle, mut receiver) = receiver(&server).await;
+    poll(&mut receiver).await;
+    poll(&mut receiver).await;
+    assert_eq!(state_count(&server), 1, "{:?}", server.requests());
+    handle.quit();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_good_get_state_is_asked_once() {
+    let server = FakeServer::start().await;
+    server.on(|_: tl::functions::updates::GetState| {
+        Ok(tl::enums::updates::State::State(
+            tl::types::updates::State {
+                pts: 1,
+                qts: 0,
+                date: 2,
+                seq: 3,
+                unread_count: 0,
+            },
+        ))
+    });
+    let (handle, mut receiver) = receiver(&server).await;
+    poll(&mut receiver).await;
+    poll(&mut receiver).await;
+    assert_eq!(state_count(&server), 1);
+    handle.quit();
+}
