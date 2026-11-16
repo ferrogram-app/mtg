@@ -49,3 +49,18 @@ jobs:
           shared-key: dev
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo test --workspace
+
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: dev
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # The floor only goes up: raise it after a step that adds coverage, never lower it.
+      - run: cargo llvm-cov --workspace --fail-under-lines 75
