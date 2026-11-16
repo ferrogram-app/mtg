@@ -306,3 +306,188 @@ impl<'a> From<&'a User> for PeerInfo {
         <PeerInfo as From<&'a tl::enums::User>>::from(&user.raw)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use mtg_testkit::FakeServer;
+
+    use super::*;
+    use crate::test_util::{client, user as raw_user, user_ref};
+
+    fn with(c: &Client, edit: impl FnOnce(&mut tl::types::User)) -> User {
+        let mut raw = raw_user(5);
+        let tl::enums::User::User(u) = &mut raw else {
+            unreachable!()
+        };
+        edit(u);
+        User::from_raw(c, raw)
+    }
+
+    fn empty(c: &Client) -> User {
+        User::from_raw(c, tl::types::UserEmpty { id: 8 }.into())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn names_and_contact_details() {
+        let server = FakeServer::start().await;
+        let c = client(&server);
+        let u = with(&c, |u| {
+            u.first_name = Some("Ann".into());
+            u.last_name = Some("Lee".into());
+            u.username = Some("ann".into());
+            u.phone = Some("123".into());
+            u.lang_code = Some("en".into());
+            u.bot_inline_placeholder = Some("search".into());
+            u.usernames = Some(vec![
+                tl::types::Username {
+                    editable: false,
+                    active: true,
+                    deletable: false,
+                    expired: false,
+                    username: "ann2".into(),
+                }
+                .into(),
+            ]);
+        });
+        assert_eq!(u.id(), PeerId::user_unchecked(5));
+        assert_eq!((u.first_name(), u.last_name()), (Some("Ann"), Some("Lee")));
+        assert_eq!(u.full_name(), "Ann Lee");
+        assert_eq!(
+            (u.username(), u.phone(), u.lang_code()),
+            (Some("ann"), Some("123"), Some("en"))
+        );
+        assert_eq!(u.usernames(), ["ann2"]);
+        assert_eq!(u.bot_inline_placeholder(), Some("search"));
+        assert!(format!("{u:?}").contains("Ann"));
+
+        let bare = with(&c, |_| {});
+        assert_eq!(bare.full_name(), "");
+        assert!(bare.usernames().is_empty() && bare.username().is_none());
+        // an empty last name counts as none
+        let blank = with(&c, |u| {
+            u.first_name = Some("Bo".into());
+            u.last_name = Some(String::new());
+        });
+        assert_eq!(
+            (blank.last_name(), blank.full_name().as_str()),
+            (None, "Bo")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn flags_follow_the_raw_user() {
+        let server = FakeServer::start().await;
+        let c = client(&server);
+        let on = with(&c, |u| {
+            u.is_self = true;
+            u.contact = true;
+            u.mutual_contact = true;
+            u.deleted = true;
+            u.bot = true;
+            u.bot_chat_history = false;
+            u.bot_nochats = true;
+            u.verified = true;
+            u.restricted = true;
+            u.bot_inline_geo = true;
+            u.support = true;
+            u.scam = true;
+        });
+        assert!(on.is_self() && on.contact() && on.mutual_contact() && on.deleted());
+        assert!(on.is_bot() && on.bot_privacy() && on.verified() && on.restricted());
+        assert!(on.bot_inline_geo() && on.support() && on.scam());
+        assert!(on.bot_supports_chats());
+
+        let off = with(&c, |u| u.bot_chat_history = true);
+        assert!(!off.is_self() && !off.contact() && !off.is_bot() && !off.bot_privacy());
+        assert!(!off.bot_supports_chats());
+
+        let e = empty(&c);
+        assert!(!e.is_self() && !e.contact() && !e.mutual_contact() && !e.deleted());
+        assert!(!e.is_bot() && !e.bot_privacy() && !e.verified() && !e.restricted());
+        assert!(!e.bot_inline_geo() && !e.support() && !e.scam());
+        assert!(!e.clone().bot_supports_chats());
+        assert!(e.first_name().is_none() && e.last_name().is_none() && e.phone().is_none());
+        assert_eq!(e.full_name(), "");
+        assert!(e.usernames().is_empty() && e.username().is_none() && e.lang_code().is_none());
+        assert!(e.bot_inline_placeholder().is_none() && e.restriction_reason().is_empty());
+        assert!(e.photo().is_none());
+        assert!(matches!(e.status(), tl::enums::UserStatus::Empty));
+        assert_eq!(e.id(), PeerId::user_unchecked(8));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn status_photo_and_restrictions() {
+        let server = FakeServer::start().await;
+        let c = client(&server);
+        let u = with(&c, |u| {
+            u.status = Some(tl::types::UserStatusOnline { expires: 9 }.into());
+            u.photo = Some(
+                tl::types::UserProfilePhoto {
+                    has_video: false,
+                    personal: false,
+                    photo_id: 4,
+                    stripped_thumb: None,
+                    dc_id: 2,
+                }
+                .into(),
+            );
+            u.restriction_reason = Some(vec![
+                tl::types::RestrictionReason {
+                    platform: "all-ios-wp-web".into(),
+                    reason: "porn".into(),
+                    text: "no".into(),
+                }
+                .into(),
+            ]);
+        });
+        assert!(matches!(u.status(), tl::enums::UserStatus::Online(s) if s.expires == 9));
+        assert_eq!(u.photo().unwrap().photo_id, 4);
+        let reasons = u.restriction_reason();
+        assert_eq!(
+            (reasons[0].reason.as_str(), reasons[0].text.as_str()),
+            ("porn", "no")
+        );
+        assert!(matches!(
+            reasons[0].platforms[..],
+            [
+                Platform::All,
+                Platform::Ios,
+                Platform::WindowsPhone,
+                Platform::Other(_)
+            ]
+        ));
+        let android = RestrictionReason::from_raw(
+            &tl::types::RestrictionReason {
+                platform: "android".into(),
+                reason: String::new(),
+                text: String::new(),
+            }
+            .into(),
+        );
+        assert!(matches!(android.platforms[..], [Platform::Android]));
+
+        let no_photo = with(&c, |u| u.photo = Some(tl::enums::UserProfilePhoto::Empty));
+        assert!(no_photo.photo().is_none());
+        assert!(with(&c, |_| {}).photo().is_none());
+        assert!(with(&c, |_| {}).restriction_reason().is_empty());
+        assert!(matches!(
+            with(&c, |_| {}).status(),
+            tl::enums::UserStatus::Empty
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn references_need_a_full_access_hash() {
+        let server = FakeServer::start().await;
+        let c = client(&server);
+        let u = with(&c, |_| {});
+        assert_eq!(u.to_ref().await.unwrap(), Some(user_ref(5)));
+        assert!(matches!(PeerInfo::from(&u), PeerInfo::User { .. }));
+        assert!(matches!(PeerInfo::from(u), PeerInfo::User { .. }));
+        // a min user carries a hash that is useless for requests; nothing is cached for it either
+        let min = with(&c, |u| u.min = true);
+        assert!(min.auth().is_none());
+        assert_eq!(min.to_ref().await.unwrap(), None);
+        assert!(empty(&c).auth().is_none());
+    }
+}
