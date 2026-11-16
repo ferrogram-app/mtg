@@ -160,4 +160,25 @@ mod tests {
         s.set_dc_addresses(1, vec![a]).await.unwrap();
         assert_eq!(s.dc_addresses(1).unwrap(), vec![a]);
     }
+
+    #[tokio::test]
+    async fn a_poisoned_lock_is_an_error_not_a_panic() {
+        let s = std::sync::Arc::new(MemorySession::default());
+        let t = s.clone();
+        let _ = std::thread::spawn(move || {
+            let _g = t.0.lock().unwrap();
+            let _h = t.1.lock().unwrap();
+            panic!("poison both");
+        })
+        .join();
+        assert!(matches!(s.home_dc_id(), Err(MemorySessionError::Poisoned)));
+        assert!(s.dc_addresses(1).is_err());
+        assert!(s.set_dc_addresses(1, vec![]).await.is_err());
+        assert!(s.set_home_dc_id(1).await.is_err());
+        assert!(s.peer(PeerId::user_unchecked(1)).await.is_err());
+        assert_eq!(
+            MemorySessionError::Poisoned.to_string(),
+            "session lock is poisoned"
+        );
+    }
 }

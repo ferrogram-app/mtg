@@ -33,6 +33,8 @@ mod peer;
 mod session;
 mod session_data;
 pub mod storages;
+#[cfg(test)]
+mod tests;
 pub mod types;
 pub mod updates;
 
