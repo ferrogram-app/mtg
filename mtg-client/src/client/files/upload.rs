@@ -224,3 +224,162 @@ impl<'a, S: AsyncRead + Unpin> PartStream<'a, S> {
         res
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+    use std::sync::Mutex;
+
+    use mtg_testkit::FakeServer;
+
+    use super::*;
+    use crate::test_util::client;
+
+    type Parts = Arc<Mutex<Vec<(i32, usize)>>>;
+
+    fn save_parts(server: &FakeServer, ok: bool) -> Parts {
+        let parts: Parts = Arc::default();
+        let p = parts.clone();
+        server.on(move |r: tl::functions::upload::SaveFilePart| {
+            p.lock().unwrap().push((r.file_part, r.bytes.len()));
+            Ok(ok)
+        });
+        parts
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_small_file_is_one_part_with_a_checksum() {
+        let server = FakeServer::start().await;
+        let parts = save_parts(&server, true);
+        let mut data = Cursor::new(b"hello".to_vec());
+        let up = client(&server)
+            .upload_stream(&mut data, 5, "h.txt".into())
+            .await
+            .unwrap();
+        let tl::enums::InputFile::File(f) = up.raw else {
+            panic!("not a small file")
+        };
+        assert_eq!((f.parts, f.name.as_str()), (1, "h.txt"));
+        assert_eq!(f.md5_checksum, "5d41402abc4b2a76b9719d911017c592");
+        assert_eq!(*parts.lock().unwrap(), [(0, 5)]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_empty_name_becomes_a_and_parts_are_chunked() {
+        let server = FakeServer::start().await;
+        let parts = save_parts(&server, true);
+        let size = MAX_CHUNK_SIZE as usize + 10;
+        let mut data = Cursor::new(vec![1u8; size]);
+        let up = client(&server)
+            .upload_stream(&mut data, size, String::new())
+            .await
+            .unwrap();
+        let tl::enums::InputFile::File(f) = up.raw else {
+            panic!()
+        };
+        assert_eq!((f.parts, f.name.as_str()), (2, "a"));
+        assert_eq!(
+            *parts.lock().unwrap(),
+            [(0, MAX_CHUNK_SIZE as usize), (1, 10)]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_part_is_an_error() {
+        let server = FakeServer::start().await;
+        save_parts(&server, false);
+        let mut data = Cursor::new(vec![0u8; 3]);
+        let err = client(&server)
+            .upload_stream(&mut data, 3, "x".into())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("failed to store"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_rpc_error_is_an_io_error() {
+        let server = FakeServer::start().await;
+        server.on(|_: tl::functions::upload::SaveFilePart| {
+            Err::<bool, _>((400, "FILE_PARTS_INVALID".into()))
+        });
+        let mut data = Cursor::new(vec![0u8; 3]);
+        let err = client(&server)
+            .upload_stream(&mut data, 3, "x".into())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("FILE_PARTS_INVALID"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stream_shorter_than_announced_is_an_error() {
+        let server = FakeServer::start().await;
+        save_parts(&server, true);
+        // two parts announced, only half a part available
+        let mut data = Cursor::new(vec![0u8; 100]);
+        let size = MAX_CHUNK_SIZE as usize * 2;
+        let err = client(&server)
+            .upload_stream(&mut data, size, "x".into())
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_big_file_goes_through_the_parallel_workers() {
+        let server = FakeServer::start().await;
+        let seen: Parts = Arc::default();
+        let s = seen.clone();
+        server.on(move |r: tl::functions::upload::SaveBigFilePart| {
+            s.lock()
+                .unwrap()
+                .push((r.file_part, r.file_total_parts as usize));
+            Ok(true)
+        });
+        let size = BIG_FILE_SIZE + 1;
+        let mut data = Cursor::new(vec![0u8; size]);
+        let up = client(&server)
+            .upload_stream(&mut data, size, "big".into())
+            .await
+            .unwrap();
+        let tl::enums::InputFile::Big(f) = up.raw else {
+            panic!("not a big file")
+        };
+        let total = size.div_ceil(MAX_CHUNK_SIZE as usize);
+        assert_eq!((f.parts as usize, f.name.as_str()), (total, "big"));
+        let mut got: Vec<i32> = seen.lock().unwrap().iter().map(|p| p.0).collect();
+        got.sort();
+        assert_eq!(got, (0..total as i32).collect::<Vec<_>>());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_big_part_is_an_error() {
+        let server = FakeServer::start().await;
+        server.on(|_: tl::functions::upload::SaveBigFilePart| Ok(false));
+        let size = BIG_FILE_SIZE + 1;
+        let mut data = Cursor::new(vec![0u8; size]);
+        let err = client(&server)
+            .upload_stream(&mut data, size, "big".into())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("failed to store"));
+    }
+
+    #[cfg(feature = "fs")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_file_is_uploaded_by_path() {
+        let server = FakeServer::start().await;
+        let parts = save_parts(&server, true);
+        let path = std::env::temp_dir().join(format!("mtg-upload-{}.txt", std::process::id()));
+        std::fs::write(&path, b"abc").unwrap();
+        let up = client(&server).upload_file(&path).await.unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let tl::enums::InputFile::File(f) = up.raw else {
+            panic!()
+        };
+        assert!(f.name.starts_with("mtg-upload-") && f.parts == 1);
+        assert_eq!(*parts.lock().unwrap(), [(0, 3)]);
+
+        let missing = client(&server).upload_file("/nonexistent/mtg-none").await;
+        assert_eq!(missing.unwrap_err().kind(), io::ErrorKind::NotFound);
+    }
+}
