@@ -246,3 +246,262 @@ impl<'a> From<&'a Group> for PeerInfo {
         <Self as From<&'a tl::enums::Chat>>::from(&group.raw)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    use mtg_testkit::FakeServer;
+
+    use super::*;
+    use crate::test_util::{channel as raw_channel, channel_ref, chat, chat_ref, client};
+
+    fn megagroup(min: bool) -> tl::enums::Chat {
+        let tl::enums::Chat::Channel(mut raw) = raw_channel(9) else {
+            unreachable!()
+        };
+        raw.broadcast = false;
+        raw.megagroup = true;
+        raw.min = min;
+        raw.username = Some("talk".into());
+        raw.usernames = Some(vec![
+            tl::types::Username {
+                editable: false,
+                active: true,
+                deletable: false,
+                expired: false,
+                username: "talk2".into(),
+            }
+            .into(),
+        ]);
+        raw.photo = photo();
+        tl::enums::Chat::Channel(raw)
+    }
+
+    fn photo() -> tl::enums::ChatPhoto {
+        tl::types::ChatPhoto {
+            has_video: false,
+            photo_id: 3,
+            stripped_thumb: None,
+            dc_id: 2,
+        }
+        .into()
+    }
+
+    fn forbidden_channel(broadcast: bool) -> tl::enums::Chat {
+        tl::types::ChannelForbidden {
+            broadcast,
+            megagroup: !broadcast,
+            monoforum: false,
+            id: 9,
+            access_hash: 90,
+            title: "gone".into(),
+            until_date: None,
+        }
+        .into()
+    }
+
+    fn community(min: bool) -> tl::enums::Chat {
+        tl::types::Community {
+            creator: false,
+            left: false,
+            min,
+            collapsed_in_dialogs: false,
+            id: 4,
+            access_hash: Some(40),
+            title: "comm".into(),
+            photo: photo(),
+            date: 0,
+            admin_rights: None,
+            default_banned_rights: None,
+        }
+        .into()
+    }
+
+    fn community_forbidden(hash: Option<i64>) -> tl::enums::Chat {
+        tl::types::CommunityForbidden {
+            id: 5,
+            access_hash: hash,
+            title: "cf".into(),
+        }
+        .into()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn groups_wrap_every_kind_of_chat_but_not_broadcasts() {
+        let server = FakeServer::start().await;
+        let c = client(&server);
+        for raw in [
+            chat(3),
+            tl::types::ChatEmpty { id: 1 }.into(),
+            tl::types::ChatForbidden {
+                id: 2,
+                title: "f".into(),
+            }
+            .into(),
+            megagroup(false),
+            forbidden_channel(false),
+        ] {
+            let g = Group::from_raw(&c, raw);
+            assert!(format!("{g:?}").len() > 2);
+        }
+        for raw in [
+            raw_channel(9), // a broadcast
+            forbidden_channel(true),
+            community(false),
+            community_forbidden(None),
+        ] {
+            assert!(catch_unwind(AssertUnwindSafe(|| Group::from_raw(&c, raw))).is_err());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ids_and_auth_per_variant() {
+        let server = FakeServer::start().await;
+        let c = client(&server);
+        let g = |raw| Group {
+            raw,
+            client: c.clone(),
+        };
+
+        assert_eq!(g(chat(3)).id(), PeerId::chat_unchecked(3));
+        assert_eq!(
+            g(tl::types::ChatEmpty { id: 1 }.into()).id(),
+            PeerId::chat_unchecked(1)
+        );
+        assert_eq!(
+            g(tl::types::ChatForbidden {
+                id: 2,
+                title: String::new()
+            }
+            .into())
+            .id(),
+            PeerId::chat_unchecked(2)
+        );
+        assert_eq!(g(megagroup(false)).id(), PeerId::channel_unchecked(9));
+        assert_eq!(
+            g(forbidden_channel(false)).id(),
+            PeerId::channel_unchecked(9)
+        );
+        assert_eq!(g(community(false)).id(), PeerId::channel_unchecked(4));
+        assert_eq!(
+            g(community_forbidden(None)).id(),
+            PeerId::channel_unchecked(5)
+        );
+
+        for raw in [
+            chat(3),
+            tl::types::ChatEmpty { id: 1 }.into(),
+            tl::types::ChatForbidden {
+                id: 2,
+                title: String::new(),
+            }
+            .into(),
+            megagroup(false),
+            forbidden_channel(false),
+            community(false),
+            community_forbidden(Some(1)),
+        ] {
+            assert!(g(raw).auth().is_some());
+        }
+        for raw in [megagroup(true), community(true), community_forbidden(None)] {
+            assert!(g(raw).auth().is_none());
+        }
+        assert_eq!(g(chat(3)).to_ref().await.unwrap(), Some(chat_ref(3)));
+        assert_eq!(
+            g(megagroup(false)).to_ref().await.unwrap(),
+            Some(channel_ref(9))
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn titles_usernames_and_photos() {
+        let server = FakeServer::start().await;
+        let c = client(&server);
+        let g = |raw| Group {
+            raw,
+            client: c.clone(),
+        };
+
+        assert_eq!(g(tl::types::ChatEmpty { id: 1 }.into()).title(), None);
+        assert_eq!(g(chat(3)).title(), Some("group"));
+        assert_eq!(
+            g(tl::types::ChatForbidden {
+                id: 2,
+                title: "f".into()
+            }
+            .into())
+            .title(),
+            Some("f")
+        );
+        assert_eq!(g(megagroup(false)).title(), Some("title"));
+        assert_eq!(g(forbidden_channel(false)).title(), Some("gone"));
+        assert_eq!(g(community(false)).title(), Some("comm"));
+        assert_eq!(g(community_forbidden(None)).title(), Some("cf"));
+
+        let mg = g(megagroup(false));
+        assert_eq!(
+            (mg.username(), mg.usernames()),
+            (Some("talk"), vec!["talk2"])
+        );
+        assert!(mg.is_megagroup() && g(forbidden_channel(false)).is_megagroup());
+        for raw in [
+            chat(3),
+            forbidden_channel(false),
+            community(false),
+            community_forbidden(None),
+        ] {
+            let group = g(raw);
+            assert!(group.username().is_none() && group.usernames().is_empty());
+        }
+        let bare = {
+            let tl::enums::Chat::Channel(mut raw) = raw_channel(9) else {
+                unreachable!()
+            };
+            raw.broadcast = false;
+            raw.megagroup = true;
+            g(tl::enums::Chat::Channel(raw))
+        };
+        assert!(bare.usernames().is_empty());
+        for raw in [
+            chat(3),
+            tl::types::ChatEmpty { id: 1 }.into(),
+            community(false),
+            community_forbidden(None),
+        ] {
+            assert!(!g(raw).is_megagroup());
+        }
+
+        assert_eq!(mg.photo().unwrap().photo_id, 3);
+        assert_eq!(g(community(false)).photo().unwrap().photo_id, 3);
+        assert!(g(chat(3)).photo().is_none());
+        assert!(g(forbidden_channel(false)).photo().is_none());
+        assert!(g(community_forbidden(None)).photo().is_none());
+        assert!(g(tl::types::ChatEmpty { id: 1 }.into()).photo().is_none());
+        assert!(bare.photo().is_none());
+        assert!(
+            g(tl::types::ChatForbidden {
+                id: 2,
+                title: String::new()
+            }
+            .into())
+            .photo()
+            .is_none()
+        );
+        // a basic group with a real photo
+        let tl::enums::Chat::Chat(mut basic) = chat(3) else {
+            unreachable!()
+        };
+        basic.photo = photo();
+        assert_eq!(g(tl::enums::Chat::Chat(basic)).photo().unwrap().photo_id, 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn peer_info_is_derived_from_the_raw_chat() {
+        let server = FakeServer::start().await;
+        let c = client(&server);
+        let group = Group::from_raw(&c, chat(3));
+        assert!(matches!(PeerInfo::from(&group), PeerInfo::Chat { .. }));
+        assert!(matches!(PeerInfo::from(group), PeerInfo::Chat { .. }));
+    }
+}
