@@ -239,3 +239,118 @@ impl fmt::Debug for InlineQuery {
             .finish()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use mtg_testkit::FakeServer;
+
+    use super::*;
+    use crate::test_util::{client, user, user_ref};
+
+    async fn query(c: &Client, user_id: i64) -> InlineQuery {
+        InlineQuery {
+            raw: tl::types::UpdateBotInlineQuery {
+                query_id: 9,
+                user_id,
+                query: "cats".into(),
+                geo: None,
+                peer_type: Some(tl::enums::InlineQueryPeerType::Pm),
+                offset: "o1".into(),
+            }
+            .into(),
+            state: State {
+                date: 0,
+                seq: 0,
+                message_box: None,
+            },
+            client: c.clone(),
+            peers: c.build_peer_map(vec![user(5)], vec![]).await,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_query_exposes_its_fields_and_sender() {
+        let server = FakeServer::start().await;
+        let c = client(&server);
+        let q = query(&c, 5).await;
+        assert_eq!((q.text(), q.offset(), q.query_id()), ("cats", "o1", 9));
+        assert!(matches!(
+            q.peer_type(),
+            Some(tl::enums::InlineQueryPeerType::Pm)
+        ));
+        assert_eq!(q.sender_id(), PeerId::user_unchecked(5));
+        assert!(q.sender().is_some());
+        assert_eq!(q.sender_ref().await.unwrap(), Some(user_ref(5)));
+        assert!(format!("{q:?}").contains("cats"));
+        // somebody the update did not bring along
+        let stranger = query(&c, 6).await;
+        assert!(stranger.sender().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_answer_sends_every_option() {
+        let server = FakeServer::start().await;
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        server.on(move |req: tl::functions::messages::SetInlineBotResults| {
+            log.lock().unwrap().push(req);
+            Ok(true)
+        });
+        let c = client(&server);
+        let q = query(&c, 5).await;
+        q.answer(Vec::<Article>::new()).send().await.unwrap();
+        q.answer([Article::new("t", "body").id("a")])
+            .gallery()
+            .private()
+            .cache_time(60)
+            .next_offset("o2")
+            .switch_pm("go", "start")
+            .send()
+            .await
+            .unwrap();
+        let seen = seen.lock().unwrap();
+        assert!(seen[0].results.is_empty() && !seen[0].gallery && !seen[0].private);
+        let r = &seen[1];
+        assert_eq!((r.query_id, r.cache_time), (9, 60));
+        assert!(r.gallery && r.private);
+        assert_eq!(r.next_offset.as_deref(), Some("o2"));
+        let Some(tl::enums::InlineBotSwitchPm::Pm(pm)) = &r.switch_pm else {
+            panic!("no switch_pm")
+        };
+        assert_eq!((pm.text.as_str(), pm.start_param.as_str()), ("go", "start"));
+        assert_eq!(r.results.len(), 1);
+    }
+
+    #[test]
+    fn an_article_is_built_step_by_step() {
+        let plain = Article::new(
+            "title",
+            InputMessage::new().text("hello").link_preview(false),
+        );
+        assert_eq!(plain.raw.title.as_deref(), Some("title"));
+        assert!(plain.raw.id.parse::<i64>().is_ok());
+        assert!(
+            plain.raw.description.is_none() && plain.raw.url.is_none() && plain.raw.thumb.is_none()
+        );
+        let tl::enums::InputBotInlineMessage::Text(m) = &plain.raw.send_message else {
+            panic!("not a text message")
+        };
+        assert_eq!(m.message, "hello");
+        assert!(m.no_webpage);
+
+        let full = Article::new("t", "x")
+            .id("custom")
+            .description("d")
+            .url("https://example.com")
+            .thumb_url("https://example.com/t.jpg");
+        assert_eq!(full.raw.id, "custom");
+        assert_eq!(full.raw.description.as_deref(), Some("d"));
+        assert_eq!(full.raw.url.as_deref(), Some("https://example.com"));
+        let Some(tl::enums::InputWebDocument::Document(thumb)) = &full.raw.thumb else {
+            panic!("no thumb")
+        };
+        assert_eq!(thumb.url, "https://example.com/t.jpg");
+        let result: tl::enums::InputBotInlineResult = full.into();
+        assert!(matches!(result, tl::enums::InputBotInlineResult::Result(r) if r.id == "custom"));
+    }
+}
