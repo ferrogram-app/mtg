@@ -131,7 +131,18 @@ impl DownloadIter {
                     dc = err.value.unwrap_or_default() as _;
                     continue;
                 }
-                Err(e) => Err(e),
+                // the offset is at (or past) the end: the file ended on a chunk boundary
+                Err(InvocationError::Rpc(err))
+                    if err.name == "OFFSET_INVALID" && request.offset > 0 =>
+                {
+                    self.done = true;
+                    Ok(None)
+                }
+                Err(e) => {
+                    // keep the request so that asking again retries this chunk
+                    self.variant = DownloadIterVariant::Request(request);
+                    Err(e)
+                }
             };
         }
     }
@@ -236,6 +247,8 @@ impl Client {
         while let Some(chunk) = download.next().await.map_err(io::Error::other)? {
             file.write_all(&chunk).await?;
         }
+        // tokio writes in the background: without a flush the last chunk can be lost on drop
+        file.flush().await?;
 
         Ok(())
     }
@@ -334,6 +347,7 @@ impl Client {
             file.write_all(&data).await?;
             pos = offset + data.len() as u64;
         }
+        file.flush().await?;
 
         // Check if all tasks finished succesfully
         for task in tasks {
@@ -345,3 +359,208 @@ impl Client {
 }
 
 mod upload;
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+
+    use mtg_mtsender::SenderPool;
+    use mtg_testkit::FakeServer;
+
+    use super::*;
+
+    struct Thing {
+        size: Option<usize>,
+        data: Option<Vec<u8>>,
+        located: bool,
+    }
+
+    impl Downloadable for Thing {
+        fn to_raw_input_location(&self) -> Option<tl::enums::InputFileLocation> {
+            self.located.then(|| {
+                tl::types::InputPeerPhotoFileLocation {
+                    big: false,
+                    peer: tl::types::InputPeerSelf {}.into(),
+                    photo_id: 1,
+                }
+                .into()
+            })
+        }
+        fn to_data(&self) -> Option<Vec<u8>> {
+            self.data.clone()
+        }
+        fn size(&self) -> Option<usize> {
+            self.size
+        }
+    }
+
+    fn thing(size: Option<usize>) -> Thing {
+        Thing {
+            size,
+            data: None,
+            located: true,
+        }
+    }
+
+    fn file(bytes: Vec<u8>) -> tl::enums::upload::File {
+        tl::enums::upload::File::File(tl::types::upload::File {
+            r#type: tl::enums::storage::FileType::FileUnknown,
+            mtime: 0,
+            bytes,
+        })
+    }
+
+    fn client(server: &FakeServer) -> Client {
+        let pool = SenderPool::new(server.session(), 1);
+        tokio::spawn(pool.runner.run());
+        Client::new(pool.handle)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn chunks_come_in_order_until_a_short_one() {
+        let server = FakeServer::start().await;
+        server.on(|r: tl::functions::upload::GetFile| {
+            assert!(r.cdn_supported);
+            Ok(file(vec![
+                r.offset as u8 / 4;
+                (3 * 4096 - r.offset as usize).min(4096)
+            ]))
+        });
+        let client = client(&server);
+        let mut it = client.iter_download(&thing(None)).chunk_size(4096);
+        let mut sizes = Vec::new();
+        while let Some(chunk) = it.next().await.unwrap() {
+            sizes.push(chunk.len());
+        }
+        // the third chunk is full, the fourth asks past the end and comes back empty
+        assert_eq!(sizes, [4096, 4096, 4096]);
+        assert!(it.next().await.unwrap().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_known_size_ends_the_download_without_an_extra_request() {
+        let server = FakeServer::start().await;
+        server.on(|_: tl::functions::upload::GetFile| Ok(file(vec![1; 4096])));
+        let client = client(&server);
+        let mut it = client.iter_download(&thing(Some(4096))).chunk_size(4096);
+        assert_eq!(it.next().await.unwrap().unwrap().len(), 4096);
+        assert!(it.next().await.unwrap().is_none());
+        assert_eq!(
+            server
+                .requests()
+                .iter()
+                .filter(|r| **r == "GetFile")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn offset_invalid_after_the_first_chunk_is_the_end_of_the_file() {
+        let server = FakeServer::start().await;
+        server.on(|r: tl::functions::upload::GetFile| {
+            if r.offset == 0 {
+                Ok(file(vec![1; 4096]))
+            } else {
+                Err((400, "OFFSET_INVALID".into()))
+            }
+        });
+        let client = client(&server);
+        let mut it = client.iter_download(&thing(None)).chunk_size(4096);
+        assert_eq!(it.next().await.unwrap().unwrap().len(), 4096);
+        assert!(it.next().await.unwrap().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn offset_invalid_at_the_start_and_other_errors_are_errors_that_can_be_retried() {
+        let server = FakeServer::start().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        server.on(
+            move |_: tl::functions::upload::GetFile| match seen.fetch_add(1, SeqCst) {
+                0 => Err((400, "OFFSET_INVALID".into())),
+                1 => Err((400, "LOCATION_INVALID".into())),
+                _ => Ok(file(vec![9; 10])),
+            },
+        );
+        let client = client(&server);
+        let mut it = client.iter_download(&thing(None));
+        for _ in 0..2 {
+            let InvocationError::Rpc(_) = it.next().await.unwrap_err() else {
+                panic!("not an rpc error")
+            };
+        }
+        // the failed chunk was not lost: asking again gets it
+        assert_eq!(it.next().await.unwrap().unwrap(), vec![9; 10]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn predownloaded_and_not_downloadable_media() {
+        let server = FakeServer::start().await;
+        let client = client(&server);
+        let data = Thing {
+            size: None,
+            data: Some(vec![1, 2]),
+            located: false,
+        };
+        let mut it = client.iter_download(&data);
+        assert_eq!(it.next().await.unwrap().unwrap(), vec![1, 2]);
+        assert!(it.next().await.unwrap().is_none());
+        let none = Thing {
+            size: None,
+            data: None,
+            located: false,
+        };
+        let mut it = client.iter_download(&none);
+        assert!(matches!(it.next().await, Err(InvocationError::Io(_))));
+        assert!(server.requests().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_big_file_is_fetched_by_several_workers_and_written_in_place() {
+        let server = FakeServer::start().await;
+        let size = 3 * MAX_CHUNK_SIZE as usize + 100;
+        server.on(move |r: tl::functions::upload::GetFile| {
+            let from = r.offset as usize;
+            let to = (from + r.limit as usize).min(size);
+            Ok(file((from..to).map(|i| (i / 1000) as u8).collect()))
+        });
+        let client = client(&server);
+        let dir = std::env::temp_dir().join(format!("mtg-files-test-{}", std::process::id()));
+        let path = dir.with_extension("bin");
+        client
+            .download_media_concurrent(
+                thing(Some(size)).to_raw_input_location().unwrap(),
+                size,
+                &path,
+                2,
+                2,
+            )
+            .await
+            .unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(bytes.len(), size);
+        let bad = bytes
+            .iter()
+            .enumerate()
+            .find(|(i, b)| **b != (i / 1000) as u8);
+        assert_eq!(bad, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn download_media_writes_a_small_file_completely() {
+        let server = FakeServer::start().await;
+        server.on(|_: tl::functions::upload::GetFile| Ok(file(vec![7; 4101])));
+        let client = client(&server);
+        let path = std::env::temp_dir().join(format!("mtg-small-{}.bin", std::process::id()));
+        client
+            .download_media(&thing(Some(4101)), &path)
+            .await
+            .unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(bytes, vec![7; 4101]);
+    }
+}
