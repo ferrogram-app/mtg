@@ -91,7 +91,64 @@ impl Client {
 mod tests {
     use core::future::Future;
 
+    use mtg_testkit::FakeServer;
+
     use super::*;
+    use crate::test_util::{client, message, sent, user_ref};
+
+    async fn stream(server: &FakeServer) -> (UpdateStream, mpsc::Sender<UpdatesLike>) {
+        let (tx, rx) = mpsc::channel(8);
+        let stream = client(server)
+            .stream_updates(rx, UpdatesConfiguration { catch_up: false })
+            .await
+            .unwrap();
+        (stream, tx)
+    }
+
+    fn new_message(id: i32, pts: i32) -> UpdatesLike {
+        UpdatesLike::Updates(tl::enums::Updates::Updates(tl::types::Updates {
+            updates: vec![
+                tl::types::UpdateNewMessage {
+                    message: message(id, user_ref(5), "x", 0),
+                    pts,
+                    pts_count: 1,
+                }
+                .into(),
+            ],
+            users: Vec::new(),
+            chats: Vec::new(),
+            date: 0,
+            seq: 0,
+        }))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn updates_come_out_in_order_raw_and_typed() {
+        let server = FakeServer::start().await;
+        let (mut stream, tx) = stream(&server).await;
+        tx.send(new_message(1, 1)).await.unwrap();
+        tx.send(new_message(2, 2)).await.unwrap();
+
+        let (raw, _, _) = stream.next_raw().await.unwrap();
+        assert!(matches!(raw, tl::enums::Update::NewMessage(m) if m.pts == 1));
+        // `next` wraps the same raw update into the typed one
+        assert!(matches!(stream.next().await.unwrap(), Update::NewMessage(m) if m.id() == 2));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_update_state_can_be_synced() {
+        let server = FakeServer::start().await;
+        let (stream, _tx) = stream(&server).await;
+        stream.sync_update_state().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_closed_feed_ends_the_stream_with_an_error() {
+        let server = FakeServer::start().await;
+        let (mut stream, tx) = stream(&server).await;
+        drop(tx);
+        assert!(stream.next_raw().await.is_err());
+    }
 
     fn get_update_stream() -> UpdateStream {
         panic!()
