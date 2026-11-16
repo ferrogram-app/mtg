@@ -314,5 +314,7 @@ fn message_channel_id(message: &tl::enums::Message) -> Option<i64> {
 
 mod pts_info;
 mod short;
+#[cfg(test)]
+mod tests;
 
 use short::{update_short_chat_message, update_short_message, update_short_sent_message};
