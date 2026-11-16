@@ -312,3 +312,408 @@ mod banned;
 
 pub use banned::BannedRightsBuilder;
 pub(crate) use banned::BannedRightsBuilderInner;
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use mtg_testkit::FakeServer;
+    use mtg_tl_types::{Deserializable, Serializable};
+
+    use super::*;
+    use crate::test_util::{channel_ref, chat_ref, client, user, user_ref};
+
+    type Log = Arc<Mutex<Vec<String>>>;
+    type AdminLog = Arc<Mutex<Vec<(tl::types::ChatAdminRights, Option<String>)>>>;
+    type RankLog = Arc<Mutex<Vec<(bool, Option<String>)>>>;
+
+    fn updates() -> tl::enums::Updates {
+        tl::enums::Updates::Updates(tl::types::Updates {
+            updates: Vec::new(),
+            users: Vec::new(),
+            chats: Vec::new(),
+            date: 0,
+            seq: 0,
+        })
+    }
+
+    fn rights() -> tl::types::ChatAdminRights {
+        tl::types::ChatAdminRights {
+            change_info: true,
+            post_messages: false,
+            edit_messages: false,
+            delete_messages: true,
+            ban_users: false,
+            invite_users: false,
+            pin_messages: false,
+            add_admins: false,
+            anonymous: false,
+            manage_call: false,
+            other: false,
+            manage_topics: false,
+            post_stories: false,
+            edit_stories: false,
+            delete_stories: false,
+            manage_direct_messages: false,
+            manage_ranks: false,
+            manage_linked_peers: false,
+            manage_welcome_messages: false,
+        }
+    }
+
+    fn answer(p: tl::enums::ChannelParticipant) -> tl::enums::channels::ChannelParticipant {
+        tl::types::channels::ChannelParticipant {
+            participant: p,
+            chats: Vec::new(),
+            users: Vec::new(),
+        }
+        .into()
+    }
+
+    fn banned_rights() -> tl::types::ChatBannedRights {
+        tl::types::ChatBannedRights {
+            view_messages: false,
+            send_messages: true,
+            send_media: false,
+            send_stickers: false,
+            send_gifs: false,
+            send_games: false,
+            send_inline: false,
+            embed_links: false,
+            send_polls: false,
+            change_info: false,
+            invite_users: false,
+            pin_messages: false,
+            manage_topics: false,
+            send_photos: false,
+            send_videos: false,
+            send_roundvideos: false,
+            send_audios: false,
+            send_voices: false,
+            send_docs: false,
+            send_plain: false,
+            edit_rank: false,
+            send_reactions: false,
+            manage_linked_peers: false,
+            until_date: 5,
+        }
+    }
+
+    fn full_chat(participants: Vec<tl::enums::ChatParticipant>) -> tl::enums::messages::ChatFull {
+        let mut b = 0u32.to_le_bytes().to_vec();
+        b.extend(1i64.to_le_bytes());
+        b.extend(String::new().to_bytes());
+        b.extend(
+            tl::enums::ChatParticipants::from(tl::types::ChatParticipants {
+                chat_id: 1,
+                participants,
+                version: 1,
+            })
+            .to_bytes(),
+        );
+        b.extend(0x99622c0cu32.to_le_bytes()); // peerNotifySettings
+        b.extend(0u32.to_le_bytes());
+        tl::types::messages::ChatFull {
+            full_chat: tl::types::ChatFull::from_bytes(&b).unwrap().into(),
+            chats: Vec::new(),
+            users: vec![user(5), user(6)],
+        }
+        .into()
+    }
+
+    fn is_peer_invalid(r: Result<(), InvocationError>) -> bool {
+        matches!(r, Err(InvocationError::Rpc(e)) if e.name == "PEER_ID_INVALID")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn admin_rights_of_a_channel_are_sent_with_every_flag() {
+        let server = FakeServer::start().await;
+        let seen: AdminLog = Arc::default();
+        let log = seen.clone();
+        server.on(move |req: tl::functions::channels::EditAdmin| {
+            let tl::enums::ChatAdminRights::Rights(r) = req.admin_rights;
+            log.lock().unwrap().push((r, req.rank));
+            Ok(updates())
+        });
+        client(&server)
+            .set_admin_rights(channel_ref(9), user_ref(5))
+            .anonymous(true)
+            .manage_call(true)
+            .change_info(true)
+            .post_messages(true)
+            .edit_messages(true)
+            .delete_messages(true)
+            .ban_users(true)
+            .invite_users(true)
+            .pin_messages(true)
+            .add_admins(true)
+            .rank("boss")
+            .await
+            .unwrap();
+        let seen = seen.lock().unwrap();
+        let (r, rank) = &seen[0];
+        assert_eq!(rank.as_deref(), Some("boss"));
+        assert!(r.anonymous && r.manage_call && r.change_info && r.post_messages);
+        assert!(r.edit_messages && r.delete_messages && r.ban_users && r.invite_users);
+        assert!(r.pin_messages && r.add_admins && !r.other);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_basic_group_promotes_or_demotes_and_other_peers_are_refused() {
+        let server = FakeServer::start().await;
+        let seen: Log = Arc::default();
+        let log = seen.clone();
+        server.on(move |req: tl::functions::messages::EditChatAdmin| {
+            log.lock()
+                .unwrap()
+                .push(format!("{} {}", req.chat_id, req.is_admin));
+            Ok(true)
+        });
+        let c = client(&server);
+        c.set_admin_rights(chat_ref(3), user_ref(5)).await.unwrap();
+        c.set_admin_rights(chat_ref(3), user_ref(5))
+            .pin_messages(true)
+            .await
+            .unwrap();
+        assert_eq!(*seen.lock().unwrap(), ["3 false", "3 true"]);
+        assert!(is_peer_invalid(
+            c.set_admin_rights(user_ref(7), user_ref(5)).await
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn current_channel_rights_come_from_creator_admin_or_are_kept() {
+        let server = FakeServer::start().await;
+        let which = Arc::new(Mutex::new(0));
+        let w = which.clone();
+        let seen: RankLog = Arc::default();
+        let log = seen.clone();
+        server.on(move |_: tl::functions::channels::GetParticipant| {
+            Ok(answer(match *w.lock().unwrap() {
+                0 => tl::types::ChannelParticipantCreator {
+                    user_id: 5,
+                    admin_rights: rights().into(),
+                    rank: Some("owner".into()),
+                }
+                .into(),
+                1 => tl::types::ChannelParticipantAdmin {
+                    can_edit: true,
+                    is_self: false,
+                    user_id: 5,
+                    inviter_id: None,
+                    promoted_by: 1,
+                    date: 1,
+                    admin_rights: rights().into(),
+                    rank: None,
+                }
+                .into(),
+                _ => tl::types::ChannelParticipantLeft {
+                    peer: tl::types::PeerUser { user_id: 5 }.into(),
+                }
+                .into(),
+            }))
+        });
+        server.on(move |req: tl::functions::channels::EditAdmin| {
+            let tl::enums::ChatAdminRights::Rights(r) = req.admin_rights;
+            log.lock().unwrap().push((r.change_info, req.rank));
+            Ok(updates())
+        });
+        let c = client(&server);
+        for step in 0..3 {
+            *which.lock().unwrap() = step;
+            c.set_admin_rights(channel_ref(9), user_ref(5))
+                .load_current()
+                .await
+                .unwrap()
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                (true, Some("owner".to_string())),
+                (true, Some(String::new())),
+                (false, Some(String::new()))
+            ]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn current_group_rights_are_found_among_the_members() {
+        let server = FakeServer::start().await;
+        server.on(|_: tl::functions::messages::GetFullChat| {
+            Ok(full_chat(vec![
+                tl::types::ChatParticipant {
+                    user_id: 5,
+                    inviter_id: 1,
+                    date: 7,
+                    rank: None,
+                }
+                .into(),
+                tl::types::ChatParticipantAdmin {
+                    user_id: 6,
+                    inviter_id: 1,
+                    date: 7,
+                    rank: None,
+                }
+                .into(),
+            ]))
+        });
+        let seen: Log = Arc::default();
+        let log = seen.clone();
+        server.on(move |req: tl::functions::messages::EditChatAdmin| {
+            log.lock()
+                .unwrap()
+                .push(format!("{} {}", req.chat_id, req.is_admin));
+            Ok(true)
+        });
+        let c = client(&server);
+        // 6 is an admin: its rights are filled in, so it stays one
+        c.set_admin_rights(chat_ref(3), user_ref(6))
+            .load_current()
+            .await
+            .unwrap()
+            .await
+            .unwrap();
+        // 5 is an ordinary member: nothing to load
+        c.set_admin_rights(chat_ref(3), user_ref(5))
+            .load_current()
+            .await
+            .unwrap()
+            .await
+            .unwrap();
+        assert_eq!(*seen.lock().unwrap(), ["3 true", "3 false"]);
+        // not a user: the builder cannot tell who to look for
+        let bad = c
+            .set_admin_rights(chat_ref(3), channel_ref(9))
+            .load_current()
+            .await;
+        assert!(matches!(bad, Err(InvocationError::Rpc(_))));
+        // other peers have nothing to load
+        drop(
+            c.set_admin_rights(user_ref(7), user_ref(5))
+                .load_current()
+                .await
+                .unwrap(),
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn banning_in_a_channel_sends_the_inverted_flags() {
+        let server = FakeServer::start().await;
+        let seen: Arc<Mutex<Vec<tl::types::ChatBannedRights>>> = Arc::default();
+        let log = seen.clone();
+        server.on(move |req: tl::functions::channels::EditBanned| {
+            let tl::enums::ChatBannedRights::Rights(r) = req.banned_rights;
+            log.lock().unwrap().push(r);
+            Ok(updates())
+        });
+        let c = client(&server);
+        c.set_banned_rights(channel_ref(9), user_ref(5))
+            .view_messages(true)
+            .send_messages(false)
+            .send_media(false)
+            .send_stickers(false)
+            .send_gifs(false)
+            .send_games(false)
+            .send_inline(false)
+            .embed_link_previews(false)
+            .send_polls(false)
+            .change_info(false)
+            .invite_users(false)
+            .pin_messages(false)
+            .until(77)
+            .await
+            .unwrap();
+        c.set_banned_rights(channel_ref(9), user_ref(5))
+            .duration(Duration::from_secs(1000))
+            .await
+            .unwrap();
+        let seen = seen.lock().unwrap();
+        let r = &seen[0];
+        assert!(!r.view_messages && r.send_messages && r.send_media && r.send_stickers);
+        assert!(r.send_gifs && r.send_games && r.send_inline && r.embed_links && r.send_polls);
+        assert!(r.change_info && r.invite_users && r.pin_messages);
+        assert_eq!(r.until_date, 77);
+        assert!(seen[1].until_date > 1000);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn banning_loads_current_rights_in_channels_only() {
+        let server = FakeServer::start().await;
+        let seen: Arc<Mutex<Vec<i32>>> = Arc::default();
+        let log = seen.clone();
+        let banned = Arc::new(Mutex::new(true));
+        let flag = banned.clone();
+        server.on(move |_: tl::functions::channels::GetParticipant| {
+            Ok(answer(if *flag.lock().unwrap() {
+                tl::types::ChannelParticipantBanned {
+                    left: false,
+                    peer: tl::types::PeerUser { user_id: 5 }.into(),
+                    kicked_by: 1,
+                    date: 1,
+                    banned_rights: banned_rights().into(),
+                    rank: None,
+                }
+                .into()
+            } else {
+                tl::types::ChannelParticipantLeft {
+                    peer: tl::types::PeerUser { user_id: 5 }.into(),
+                }
+                .into()
+            }))
+        });
+        server.on(move |req: tl::functions::channels::EditBanned| {
+            let tl::enums::ChatBannedRights::Rights(r) = req.banned_rights;
+            log.lock().unwrap().push(r.until_date);
+            Ok(updates())
+        });
+        let c = client(&server);
+        let b = c
+            .set_banned_rights(channel_ref(9), user_ref(5))
+            .load_current()
+            .await
+            .unwrap();
+        b.await.unwrap();
+        *banned.lock().unwrap() = false;
+        let b = c
+            .set_banned_rights(channel_ref(9), user_ref(5))
+            .load_current()
+            .await
+            .unwrap();
+        b.await.unwrap();
+        drop(
+            c.set_banned_rights(chat_ref(3), user_ref(5))
+                .load_current()
+                .await
+                .unwrap(),
+        );
+        assert_eq!(*seen.lock().unwrap(), [5, 0]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn banning_in_a_basic_group_kicks_or_refuses() {
+        let server = FakeServer::start().await;
+        let seen: Log = Arc::default();
+        let log = seen.clone();
+        server.on(move |req: tl::functions::messages::DeleteChatUser| {
+            log.lock().unwrap().push(format!("{}", req.chat_id));
+            Ok(updates())
+        });
+        let c = client(&server);
+        c.set_banned_rights(chat_ref(3), user_ref(5))
+            .view_messages(false)
+            .await
+            .unwrap();
+        assert_eq!(*seen.lock().unwrap(), ["3"]);
+        let refused = c
+            .set_banned_rights(chat_ref(3), user_ref(5))
+            .send_messages(false)
+            .await;
+        assert!(matches!(refused, Err(InvocationError::Rpc(e)) if e.name == "CHAT_INVALID"));
+        assert!(is_peer_invalid(
+            c.set_banned_rights(user_ref(7), user_ref(5)).await
+        ));
+    }
+}
