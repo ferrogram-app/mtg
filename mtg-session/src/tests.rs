@@ -139,8 +139,10 @@ async fn the_default_trait_methods_keep_the_first_error_free_path() {
 
 #[tokio::test]
 async fn session_data_imports_into_a_storage() {
-    let mut data = SessionData::default();
-    data.home_dc = 5;
+    let mut data = SessionData {
+        home_dc: 5,
+        ..Default::default()
+    };
     data.peer_infos
         .insert(PeerId::chat_unchecked(3), PeerInfo::Chat { id: 3 });
     data.updates_state.pts = 11;
