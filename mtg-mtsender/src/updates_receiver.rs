@@ -8,6 +8,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::time::Duration;
 
 use mtg_session::storages::ErasedSession;
 use mtg_session::types::{PeerId, PeerInfo, UpdateState, UpdatesState};
@@ -22,6 +23,11 @@ use crate::{InvocationError, SenderPoolHandle, UpdatesConfiguration};
 // See https://core.telegram.org/method/updates.getChannelDifference.
 const BOT_CHANNEL_DIFF_LIMIT: i32 = 100000;
 const USER_CHANNEL_DIFF_LIMIT: i32 = 100;
+
+// Transient server trouble in `updates.getDifference` is retried this many times, waiting
+// `DIFF_RETRY_DELAY`, twice that, ... in between; then the error goes to the caller.
+const DIFF_RETRIES: u32 = 3;
+const DIFF_RETRY_DELAY: Duration = Duration::from_millis(200);
 
 /// Receives the updates of a [`SenderPool`](crate::SenderPool) and keeps the update state
 /// (pts/qts/seq) in sync with the server, fetching differences when needed.
@@ -170,7 +176,7 @@ impl UpdatesReceiver {
             };
 
             if let Some(request) = get_diff {
-                let response = self.invoke(&request).await?;
+                let response = self.invoke_difference(&request).await?;
                 let (updates, users, chats) = self.message_box.apply_difference(response);
                 self.extend_update_queue(updates, users, chats);
                 continue;
@@ -261,6 +267,28 @@ impl UpdatesReceiver {
             .do_invoke_in_dc(dc_id, request.to_bytes())
             .await
             .and_then(|body| R::Return::from_bytes(&body).map_err(|e| e.into()))
+    }
+
+    /// `updates.getDifference` with a few retries for internal server errors (500) and
+    /// `PERSISTENT_TIMESTAMP_OUTDATED` ("try again later"); other errors are final.
+    async fn invoke_difference(
+        &self,
+        request: &tl::functions::updates::GetDifference,
+    ) -> Result<tl::enums::updates::Difference, InvocationError> {
+        let mut attempt = 0;
+        loop {
+            match self.invoke(request).await {
+                Err(InvocationError::Rpc(e))
+                    if attempt < DIFF_RETRIES
+                        && (e.code == 500 || e.is("PERSISTENT_TIMESTAMP_OUTDATED")) =>
+                {
+                    warn!("getDifference failed with {e:?}, retrying");
+                    tokio::time::sleep(DIFF_RETRY_DELAY * (1 << attempt)).await;
+                    attempt += 1;
+                }
+                result => return result,
+            }
+        }
     }
 
     async fn process_socket_updates(&mut self, updates: UpdatesLike) {

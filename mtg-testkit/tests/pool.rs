@@ -552,3 +552,64 @@ async fn a_failed_difference_ends_next_with_the_error() {
     assert!(result.is_err());
     handle.quit();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_difference_that_fails_with_a_server_error_is_retried() {
+    let server = FakeServer::start().await;
+    server
+        .on(|_: tl::functions::updates::GetState| Ok(tl::enums::updates::State::State(state(10))));
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = calls.clone();
+    server.on(move |_: tl::functions::updates::GetDifference| {
+        match seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+            0 => Err((500, "INTERNAL".into())),
+            1 => Err((400, "PERSISTENT_TIMESTAMP_OUTDATED".into())),
+            _ => Ok(empty_difference()),
+        }
+    });
+    let (handle, mut receiver, feed) = receiver(&server).await;
+    feed.send(too_long()).await.unwrap();
+    // 200 ms + 400 ms of waiting between the three calls
+    assert!(receiver.next().await.is_ok());
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+    handle.quit();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_difference_that_keeps_failing_gives_up_after_the_retries() {
+    let server = FakeServer::start().await;
+    server
+        .on(|_: tl::functions::updates::GetState| Ok(tl::enums::updates::State::State(state(10))));
+    server.on(|_: tl::functions::updates::GetDifference| Err((500, "INTERNAL".into())));
+    let (handle, mut receiver, feed) = receiver(&server).await;
+    feed.send(too_long()).await.unwrap();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(10), receiver.next())
+        .await
+        .unwrap();
+    assert!(result.is_err());
+    let asked = server
+        .requests()
+        .iter()
+        .filter(|r| **r == "GetDifference")
+        .count();
+    assert_eq!(asked, 4);
+    handle.quit();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn other_difference_errors_are_not_retried() {
+    let server = FakeServer::start().await;
+    server
+        .on(|_: tl::functions::updates::GetState| Ok(tl::enums::updates::State::State(state(10))));
+    server.on(|_: tl::functions::updates::GetDifference| Err((400, "DATE_EMPTY".into())));
+    let (handle, mut receiver, feed) = receiver(&server).await;
+    feed.send(too_long()).await.unwrap();
+    assert!(receiver.next().await.is_err());
+    let asked = server
+        .requests()
+        .iter()
+        .filter(|r| **r == "GetDifference")
+        .count();
+    assert_eq!(asked, 1);
+    handle.quit();
+}
