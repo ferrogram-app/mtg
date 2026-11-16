@@ -554,4 +554,116 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].as_ref().unwrap().id(), 21);
     }
+
+    fn uploaded_photo() -> tl::enums::MessageMedia {
+        tl::enums::MessageMedia::Photo(tl::types::MessageMediaPhoto {
+            spoiler: false,
+            photo: Some(
+                tl::types::Photo {
+                    has_stickers: false,
+                    id: 5,
+                    access_hash: 6,
+                    file_reference: vec![],
+                    date: 0,
+                    sizes: vec![],
+                    video_sizes: None,
+                    dc_id: 2,
+                }
+                .into(),
+            ),
+            ttl_seconds: None,
+            live_photo: false,
+            video: None,
+        })
+    }
+
+    fn album_answer(ids: &[i64], peer: mtg_session::types::PeerRef) -> tl::enums::Updates {
+        let mut updates = Vec::new();
+        for (n, random_id) in ids.iter().enumerate() {
+            let id = n as i32 + 1;
+            updates.push(
+                tl::types::UpdateMessageId {
+                    id,
+                    random_id: *random_id,
+                }
+                .into(),
+            );
+            updates.push(
+                tl::types::UpdateNewMessage {
+                    message: message(id, peer, "c", 0),
+                    pts: id,
+                    pts_count: 1,
+                }
+                .into(),
+            );
+        }
+        tl::enums::Updates::Updates(tl::types::Updates {
+            updates,
+            users: Vec::new(),
+            chats: Vec::new(),
+            date: 0,
+            seq: 0,
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_album_uploads_external_media_and_skips_empty_ones() {
+        use crate::media::InputMedia;
+
+        let server = FakeServer::start().await;
+        let peer = user_ref(5);
+        server.on(|_: tl::functions::messages::UploadMedia| Ok(uploaded_photo()));
+        let seen = std::sync::Arc::new(std::sync::Mutex::new((0usize, false)));
+        let log = seen.clone();
+        server.on(move |req: tl::functions::messages::SendMultiMedia| {
+            let ids: Vec<i64> = req
+                .multi_media
+                .iter()
+                .map(|m| {
+                    let tl::enums::InputSingleMedia::Media(m) = m;
+                    m.random_id
+                })
+                .collect();
+            *log.lock().unwrap() = (ids.len(), req.reply_to.is_some());
+            Ok(album_answer(&ids, peer))
+        });
+        let c = client(&server);
+        let medias = vec![
+            InputMedia::new()
+                .caption("a")
+                .photo_url("https://example.com/a.jpg")
+                .reply_to(Some(3)),
+            InputMedia::new(),
+            InputMedia::new().media(tl::types::InputMediaEmpty {}),
+            InputMedia::new()
+                .caption("b")
+                .photo_url("https://example.com/b.jpg"),
+            InputMedia::new().media(tl::types::InputMediaPhoto {
+                spoiler: false,
+                id: tl::enums::InputPhoto::Empty,
+                ttl_seconds: None,
+                live_photo: false,
+                video: None,
+            }),
+        ];
+        let sent = c.send_album(peer, medias).await.unwrap();
+        assert_eq!(sent.len(), 3);
+        assert!(sent.iter().all(Option::is_some));
+        assert_eq!(*seen.lock().unwrap(), (3, true));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_album_whose_uploads_give_nothing_is_dropped() {
+        use crate::media::InputMedia;
+
+        let server = FakeServer::start().await;
+        server.on(|_: tl::functions::messages::UploadMedia| Ok(tl::enums::MessageMedia::Empty));
+        let r = client(&server)
+            .send_album(
+                user_ref(5),
+                vec![InputMedia::new().photo_url("https://example.com/a.jpg")],
+            )
+            .await;
+        assert!(matches!(r, Err(mtg_mtsender::InvocationError::Dropped(_))));
+    }
 }
