@@ -447,12 +447,247 @@ impl Client {
 
 #[cfg(test)]
 mod tests {
+    use mtg_testkit::FakeServer;
+
     use super::*;
+    use crate::test_util::{channel_ref, chat_ref, client, message, sent, user, user_ref};
 
     #[test]
     fn not_modified_unpacks_to_nothing() {
         let res = tl::types::messages::MessagesNotModified { count: 3 }.into();
         let (messages, users, chats) = unpack_messages(res);
         assert!(messages.is_empty() && users.is_empty() && chats.is_empty());
+    }
+
+    #[test]
+    fn every_kind_of_messages_unpacks_its_parts() {
+        let peer = user_ref(5);
+        let one = || vec![message(1, peer, "a", 0)];
+        let plain = tl::types::messages::Messages {
+            messages: one(),
+            topics: Vec::new(),
+            chats: Vec::new(),
+            users: vec![user(5)],
+        };
+        let (m, u, c) = unpack_messages(plain.into());
+        assert_eq!((m.len(), u.len(), c.len()), (1, 1, 0));
+        let slice = tl::types::messages::MessagesSlice {
+            inexact: false,
+            count: 1,
+            next_rate: None,
+            offset_id_offset: None,
+            search_flood: None,
+            messages: one(),
+            topics: Vec::new(),
+            chats: Vec::new(),
+            users: Vec::new(),
+        };
+        assert_eq!(unpack_messages(slice.into()).0.len(), 1);
+        let channel = tl::types::messages::ChannelMessages {
+            inexact: false,
+            pts: 1,
+            count: 1,
+            offset_id_offset: None,
+            messages: one(),
+            topics: Vec::new(),
+            chats: Vec::new(),
+            users: Vec::new(),
+        };
+        assert_eq!(unpack_messages(channel.into()).0.len(), 1);
+    }
+
+    #[test]
+    fn a_reply_points_at_the_given_message() {
+        let tl::enums::InputReplyTo::Message(r) = input_reply_to(9) else {
+            panic!("not a message reply")
+        };
+        assert_eq!(r.reply_to_msg_id, 9);
+    }
+
+    fn updates(updates: Vec<tl::enums::Update>) -> tl::enums::Updates {
+        tl::enums::Updates::Updates(tl::types::Updates {
+            updates,
+            users: Vec::new(),
+            chats: Vec::new(),
+            date: 0,
+            seq: 0,
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn random_ids_map_to_messages_of_every_new_message_kind() {
+        let server = FakeServer::start().await;
+        let c = client(&server);
+        let peer = channel_ref(9);
+        let new = |m| {
+            tl::types::UpdateNewChannelMessage {
+                message: m,
+                pts: 1,
+                pts_count: 1,
+            }
+            .into()
+        };
+        let scheduled = |m| tl::types::UpdateNewScheduledMessage { message: m }.into();
+        let id = |id, random_id| tl::types::UpdateMessageId { id, random_id }.into();
+        let got = map_random_ids_to_messages(
+            &c,
+            peer,
+            &[1, 2, 3],
+            updates(vec![
+                id(10, 1),
+                id(11, 2),
+                new(message(10, peer, "a", 0)),
+                scheduled(message(11, peer, "b", 0)),
+            ]),
+        )
+        .await
+        .unwrap();
+        let ids: Vec<_> = got.iter().map(|m| m.as_ref().map(|m| m.id())).collect();
+        assert_eq!(ids, [Some(10), Some(11), None]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_lone_message_is_taken_when_the_id_mapping_is_missing() {
+        let server = FakeServer::start().await;
+        let peer = user_ref(5);
+        let new = tl::types::UpdateNewMessage {
+            message: message(4, peer, "a", 0),
+            pts: 1,
+            pts_count: 1,
+        };
+        let got =
+            map_random_ids_to_messages(&client(&server), peer, &[1], updates(vec![new.into()]))
+                .await
+                .unwrap();
+        assert_eq!(got[0].as_ref().unwrap().id(), 4);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn anything_but_updates_cannot_be_mapped() {
+        let server = FakeServer::start().await;
+        let got = map_random_ids_to_messages(
+            &client(&server),
+            user_ref(5),
+            &[1],
+            tl::enums::Updates::TooLong,
+        )
+        .await;
+        assert!(got.is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mention_names_become_input_entities_with_the_stored_hash() {
+        let server = FakeServer::start().await;
+        let c = client(&server);
+        assert!(parse_mention_entities(&c, Vec::new()).await.is_none());
+
+        let bold = tl::enums::MessageEntity::Bold(tl::types::MessageEntityBold {
+            offset: 0,
+            length: 1,
+        });
+        let same = parse_mention_entities(&c, vec![bold.clone()])
+            .await
+            .unwrap();
+        assert_eq!(same, vec![bold.clone()]);
+
+        let mention = tl::enums::MessageEntity::MentionName(tl::types::MessageEntityMentionName {
+            offset: 1,
+            length: 2,
+            user_id: 77,
+        });
+        let out = parse_mention_entities(&c, vec![bold, mention])
+            .await
+            .unwrap();
+        let tl::enums::MessageEntity::InputMessageEntityMentionName(m) = &out[1] else {
+            panic!("not converted: {out:?}")
+        };
+        let tl::enums::InputUser::User(u) = &m.user_id else {
+            panic!("not a user")
+        };
+        assert_eq!((u.user_id, u.access_hash), (77, 0)); // unknown peer: no hash
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn messages_by_id_keep_the_order_and_drop_other_peers() {
+        let server = FakeServer::start().await;
+        let peer = user_ref(5);
+        let channel = channel_ref(9);
+        server.on(move |req: tl::functions::messages::GetMessages| {
+            assert_eq!(req.id.len(), 3);
+            Ok(tl::types::messages::Messages {
+                messages: vec![
+                    message(2, peer, "two", 0),
+                    message(1, peer, "one", 0),
+                    message(3, chat_ref(8), "stranger", 0),
+                ],
+                topics: Vec::new(),
+                chats: Vec::new(),
+                users: Vec::new(),
+            }
+            .into())
+        });
+        server.on(move |_: tl::functions::channels::GetMessages| {
+            Ok(tl::types::messages::Messages {
+                messages: vec![message(5, channel, "post", 0)],
+                topics: Vec::new(),
+                chats: Vec::new(),
+                users: Vec::new(),
+            }
+            .into())
+        });
+        let c = client(&server);
+        let got = c.get_messages_by_id(peer, &[1, 2, 3]).await.unwrap();
+        let texts: Vec<_> = got
+            .iter()
+            .map(|m| m.as_ref().map(|m| m.text().to_string()))
+            .collect();
+        assert_eq!(texts, [Some("one".into()), Some("two".into()), None]);
+        let got = c.get_messages_by_id(channel, &[5]).await.unwrap();
+        assert_eq!(got[0].as_ref().unwrap().text(), "post");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_message_that_replies_to_nothing_has_no_reply_message() {
+        let server = FakeServer::start().await;
+        let peer = user_ref(5);
+        let c = client(&server);
+        let msg = crate::message::Message::from_raw(
+            &c,
+            message(1, peer, "x", 0),
+            Some(peer),
+            c.empty_peer_map(),
+        );
+        assert!(c.get_reply_to_message(&msg).await.unwrap().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reactions_and_uploaded_media_are_sent() {
+        let server = FakeServer::start().await;
+        let peer = user_ref(5);
+        server.on(|req: tl::functions::messages::SendReaction| {
+            assert_eq!((req.msg_id, req.big), (3, true));
+            Ok(sent(0, message(3, user_ref(5), "x", 0)))
+        });
+        server.on(|_: tl::functions::messages::UploadMedia| Ok(tl::enums::MessageMedia::Empty));
+        let c = client(&server);
+        c.send_reactions(
+            peer,
+            3,
+            crate::message::InputReactions::emoticon("👍").big(),
+        )
+        .await
+        .unwrap();
+        let media = c
+            .upload_media(
+                peer,
+                tl::types::InputMediaPhotoExternal {
+                    spoiler: false,
+                    url: "https://example.com/a.jpg".into(),
+                    ttl_seconds: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(media.is_none());
     }
 }
