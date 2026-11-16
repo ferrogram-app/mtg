@@ -95,23 +95,21 @@ impl DownloadIter {
             DownloadIterVariant::Empty => return Ok(None),
         };
 
-        use tl::enums::upload::File;
-
         // TODO handle maybe FILEREF_UPGRADE_NEEDED
         let mut dc = self
             .dc_id
             .map_or_else(|| self.client.0.session.home_dc_id(), Ok)?;
 
         loop {
-            break match self.client.invoke_media_in_dc(dc, &request).await {
-                Ok(File::File(f)) => {
+            break match self.client.get_file_part(dc, &request).await {
+                Ok(bytes) => {
                     let reached_known_size = self
                         .size
-                        .is_some_and(|size| request.offset as usize + f.bytes.len() >= size);
+                        .is_some_and(|size| request.offset as usize + bytes.len() >= size);
 
-                    if reached_known_size || f.bytes.len() < request.limit as usize {
+                    if reached_known_size || bytes.len() < request.limit as usize {
                         self.done = true;
-                        if f.bytes.is_empty() {
+                        if bytes.is_empty() {
                             break Ok(None);
                         }
                     }
@@ -119,11 +117,7 @@ impl DownloadIter {
                     request.offset += request.limit as i64;
                     self.variant = DownloadIterVariant::Request(request);
 
-                    Ok(Some(f.bytes))
-                }
-                Ok(File::CdnRedirect(_)) => {
-                    // the server ignored cdn_supported = false: fail instead of trusting it
-                    break Err(InvocationError::Dropped("unexpected CdnRedirect"));
+                    Ok(Some(bytes))
                 }
                 Err(InvocationError::Rpc(err)) if &err.name == "AUTH_KEY_UNREGISTERED" => {
                     match self.client.copy_auth_to_dc(dc).await {
@@ -299,14 +293,11 @@ impl Client {
                         offset,
                         limit: MAX_CHUNK_SIZE,
                     };
-                    match client.invoke_media_in_dc(task_dc, request).await {
-                        Ok(tl::enums::upload::File::File(file)) => {
-                            if tx.send((offset as u64, file.bytes)).is_err() {
+                    match client.get_file_part(task_dc, request).await {
+                        Ok(bytes) => {
+                            if tx.send((offset as u64, bytes)).is_err() {
                                 return Err(InvocationError::Dropped("download receiver closed"));
                             }
-                        }
-                        Ok(tl::enums::upload::File::CdnRedirect(_)) => {
-                            return Err(InvocationError::Dropped("unexpected CdnRedirect"));
                         }
                         Err(InvocationError::Rpc(err)) if &err.name == "AUTH_KEY_UNREGISTERED" => {
                             match client.copy_auth_to_dc(task_dc).await {

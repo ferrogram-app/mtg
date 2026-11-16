@@ -10,6 +10,7 @@
 
 mod auth;
 mod bots;
+mod cdn;
 mod chats;
 #[allow(clippy::module_inception)]
 mod client;

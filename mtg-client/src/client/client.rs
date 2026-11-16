@@ -17,6 +17,8 @@ pub(crate) struct ClientInner {
     pub(crate) handle: SenderPoolHandle,
     pub(crate) configuration: ClientConfiguration,
     pub(crate) auth_copied_to_dcs: tokio::sync::Mutex<Vec<i32>>,
+    /// Set once the CDN public keys went to the pool.
+    pub(crate) cdn_keys: tokio::sync::OnceCell<()>,
 }
 
 /// Wrapper around [`SenderPool`] to facilitate interaction with Telegram's API.
