@@ -863,3 +863,27 @@ fn a_too_long_difference_continues_from_its_pts() {
         .apply_difference(tl::types::updates::DifferenceEmpty { date: 90, seq: 91 }.into());
     assert_eq!(message_boxes.get_difference(), None);
 }
+
+#[test]
+fn a_partial_difference_continues_from_its_intermediate_state() {
+    reset_time();
+    let mut message_boxes = MessageBoxes::new();
+    message_boxes.set_state(state(56, 78, 12, 34));
+    advance_time_by(NO_UPDATES_TIMEOUT);
+    message_boxes.check_deadlines();
+    message_boxes.apply_difference(
+        tl::types::updates::DifferenceSlice {
+            new_messages: Vec::new(),
+            new_encrypted_messages: Vec::new(),
+            other_updates: Vec::new(),
+            chats: Vec::new(),
+            users: Vec::new(),
+            intermediate_state: state(60, 80, 20, 35).into(),
+        }
+        .into(),
+    );
+    assert_eq!(
+        message_boxes.get_difference(),
+        Some(get_difference(60, 20, 35))
+    );
+}

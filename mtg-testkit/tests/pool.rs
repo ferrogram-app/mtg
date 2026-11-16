@@ -368,6 +368,7 @@ async fn receiver(
 ) -> (
     mtg_mtsender::SenderPoolFatHandle,
     mtg_mtsender::UpdatesReceiver,
+    tokio::sync::mpsc::Sender<mtg_session::updates::UpdatesLike>,
 ) {
     use mtg_session::SessionData;
     use mtg_session::storages::{MemorySession, erase};
@@ -401,15 +402,16 @@ async fn receiver(
     let session = std::sync::Arc::new(MemorySession::from(data));
     let pool = SenderPool::new(session.clone(), 1);
     tokio::spawn(pool.runner.run());
+    let (updates, feed) = tokio::sync::mpsc::channel(8);
     let receiver = mtg_mtsender::UpdatesReceiver::create(
         pool.handle.thin.clone(),
         erase(session),
-        pool.updates,
+        feed,
         Default::default(),
     )
     .await
     .unwrap();
-    (pool.handle, receiver)
+    (pool.handle, receiver, updates)
 }
 
 async fn poll(receiver: &mut mtg_mtsender::UpdatesReceiver) {
@@ -429,7 +431,7 @@ fn state_count(server: &FakeServer) -> usize {
 async fn a_failed_get_state_is_asked_again_on_the_next_call() {
     let server = FakeServer::start().await;
     server.on(|_: tl::functions::updates::GetState| Err((500, "INTERNAL".into())));
-    let (handle, mut receiver) = receiver(&server).await;
+    let (handle, mut receiver, _feed) = receiver(&server).await;
     poll(&mut receiver).await;
     poll(&mut receiver).await;
     assert!(state_count(&server) >= 2, "{:?}", server.requests());
@@ -440,7 +442,7 @@ async fn a_failed_get_state_is_asked_again_on_the_next_call() {
 async fn a_logged_out_account_does_not_repeat_get_state() {
     let server = FakeServer::start().await;
     server.on(|_: tl::functions::updates::GetState| Err((401, "AUTH_KEY_UNREGISTERED".into())));
-    let (handle, mut receiver) = receiver(&server).await;
+    let (handle, mut receiver, _feed) = receiver(&server).await;
     poll(&mut receiver).await;
     poll(&mut receiver).await;
     assert_eq!(state_count(&server), 1, "{:?}", server.requests());
@@ -461,9 +463,92 @@ async fn a_good_get_state_is_asked_once() {
             },
         ))
     });
-    let (handle, mut receiver) = receiver(&server).await;
+    let (handle, mut receiver, _feed) = receiver(&server).await;
     poll(&mut receiver).await;
     poll(&mut receiver).await;
     assert_eq!(state_count(&server), 1);
+    handle.quit();
+}
+
+fn state(pts: i32) -> tl::types::updates::State {
+    tl::types::updates::State {
+        pts,
+        qts: 0,
+        date: 2,
+        seq: 3,
+        unread_count: 0,
+    }
+}
+
+fn differences(
+    server: &FakeServer,
+    answers: Vec<tl::enums::updates::Difference>,
+) -> std::sync::Arc<std::sync::Mutex<Vec<i32>>> {
+    let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = asked.clone();
+    let answers = std::sync::Mutex::new(answers.into_iter());
+    server
+        .on(|_: tl::functions::updates::GetState| Ok(tl::enums::updates::State::State(state(10))));
+    server.on(move |r: tl::functions::updates::GetDifference| {
+        seen.lock().unwrap().push(r.pts);
+        answers
+            .lock()
+            .unwrap()
+            .next()
+            .ok_or((500, "NO_MORE_ANSWERS".to_string()))
+    });
+    asked
+}
+
+fn too_long() -> mtg_session::updates::UpdatesLike {
+    mtg_session::updates::UpdatesLike::Updates(tl::enums::Updates::TooLong)
+}
+
+fn empty_difference() -> tl::enums::updates::Difference {
+    tl::enums::updates::Difference::Empty(tl::types::updates::DifferenceEmpty { date: 5, seq: 3 })
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn updates_too_long_asks_for_the_difference_from_the_known_pts() {
+    let server = FakeServer::start().await;
+    let asked = differences(&server, vec![empty_difference()]);
+    let (handle, mut receiver, feed) = receiver(&server).await;
+    feed.send(too_long()).await.unwrap();
+    poll(&mut receiver).await;
+    assert_eq!(*asked.lock().unwrap(), vec![10]);
+    handle.quit();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_partial_difference_is_followed_by_another_from_its_pts() {
+    let server = FakeServer::start().await;
+    let slice = tl::enums::updates::Difference::Slice(tl::types::updates::DifferenceSlice {
+        new_messages: Vec::new(),
+        new_encrypted_messages: Vec::new(),
+        other_updates: Vec::new(),
+        chats: Vec::new(),
+        users: Vec::new(),
+        intermediate_state: tl::enums::updates::State::State(state(20)),
+    });
+    let asked = differences(&server, vec![slice, empty_difference()]);
+    let (handle, mut receiver, feed) = receiver(&server).await;
+    feed.send(too_long()).await.unwrap();
+    // next() hands out the (empty) first batch, then goes on with the rest
+    poll(&mut receiver).await;
+    poll(&mut receiver).await;
+    assert_eq!(*asked.lock().unwrap(), vec![10, 20]);
+    handle.quit();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_difference_ends_next_with_the_error() {
+    let server = FakeServer::start().await;
+    let _ = differences(&server, vec![]);
+    let (handle, mut receiver, feed) = receiver(&server).await;
+    feed.send(too_long()).await.unwrap();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), receiver.next())
+        .await
+        .unwrap();
+    assert!(result.is_err());
     handle.quit();
 }
