@@ -371,6 +371,14 @@ impl FakeServer {
     fn rpc(&self, body: &[u8], msg_id: i64) -> Vec<u8> {
         let mut buf = tl::Cursor::from_slice(body);
         let mut id = u32::deserialize(&mut buf).unwrap();
+        if id == 0x3072cfa1 {
+            // gzip_packed: big requests (file parts) arrive compressed
+            let packed = Vec::<u8>::deserialize(&mut buf).unwrap();
+            let mut plain = Vec::new();
+            std::io::Read::read_to_end(&mut flate2::read::GzDecoder::new(&packed[..]), &mut plain)
+                .unwrap();
+            return self.rpc(&plain, msg_id);
+        }
         while id == 0xda9b0d0d || id == 0xc1cd5ea9 {
             if id == 0xda9b0d0d {
                 self.layered

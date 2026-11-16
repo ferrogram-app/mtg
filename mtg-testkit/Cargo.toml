@@ -13,6 +13,7 @@ mtg-mtproto = { path = "../mtg-mtproto", version = "0.0.1" }
 mtg-session = { path = "../mtg-session", version = "0.0.1", default-features = false }
 mtg-tl-types = { path = "../mtg-tl-types", version = "0.0.1", features = ["tl-mtproto", "deserializable-functions"] }
 tokio = { version = "1.54.1", default-features = false, features = ["io-util", "net", "rt", "macros"] }
+flate2 = "1.1.11"
 
 [dev-dependencies]
 mtg-mtsender = { path = "../mtg-mtsender", version = "0.0.1" }
