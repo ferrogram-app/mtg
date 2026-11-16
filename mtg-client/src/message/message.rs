@@ -682,3 +682,265 @@ impl fmt::Debug for Message {
             .finish()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use mtg_testkit::FakeServer;
+    use mtg_tl_types::Serializable;
+
+    use super::*;
+    use crate::test_util::{channel_ref, client, user_ref};
+
+    fn plain(c: &Client, peer: PeerRef) -> Message {
+        let sent = tl::types::UpdateShortSentMessage {
+            out: true,
+            id: 11,
+            pts: 1,
+            pts_count: 1,
+            date: 50,
+            media: None,
+            entities: None,
+            ttl_period: None,
+        };
+        Message::from_raw_short_updates(
+            c,
+            sent,
+            InputMessage::new().text("hi").reply_to(Some(3)),
+            peer,
+        )
+    }
+
+    fn inner(m: &mut Message) -> &mut tl::types::Message {
+        let tl::enums::Message::Message(inner) = &mut m.raw else {
+            panic!("not a plain message")
+        };
+        inner
+    }
+
+    fn service(c: &Client, peer: PeerRef) -> Message {
+        let mut b = 0u32.to_le_bytes().to_vec();
+        b.extend(8i32.to_le_bytes());
+        b.extend(tl::enums::Peer::from(peer.id).to_bytes());
+        b.extend(70i32.to_le_bytes());
+        b.extend(tl::enums::MessageAction::Empty.to_bytes());
+        let raw = tl::enums::Message::Service(
+            <tl::types::MessageService as mtg_tl_types::Deserializable>::from_bytes(&b).unwrap(),
+        );
+        Message::from_raw(c, raw, Some(peer), c.empty_peer_map())
+    }
+
+    fn empty(c: &Client, peer: PeerRef) -> Message {
+        let raw = tl::enums::Message::Empty(tl::types::MessageEmpty {
+            id: 2,
+            peer_id: None,
+        });
+        Message::from_raw(c, raw, Some(peer), c.empty_peer_map())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_message_built_from_a_short_answer_has_the_basics() {
+        let server = FakeServer::start().await;
+        let c = client(&server);
+        let m = plain(&c, user_ref(5));
+        assert_eq!((m.id(), m.text(), m.outgoing()), (11, "hi", true));
+        assert_eq!(m.date_timestamp(), 50);
+        assert_eq!(m.date().as_second(), 50);
+        assert_eq!(m.reply_to_message_id(), Some(3));
+        assert!(m.reply_header().is_some());
+        assert_eq!(m.peer_id(), user_ref(5).id);
+        assert!(m.peer().is_none());
+        assert!(m.media().is_none() && m.photo().is_none());
+        assert!(m.reply_markup().is_none() && m.rich_message().is_none());
+        assert!(m.fmt_entities().is_none() && m.action().is_none());
+        assert_eq!(m.peer_ref().await.unwrap(), Some(user_ref(5)));
+        for flag in [
+            m.mentioned(),
+            m.media_unread(),
+            m.silent(),
+            m.post(),
+            m.from_scheduled(),
+            m.edit_hide(),
+            m.pinned(),
+        ] {
+            assert!(!flag);
+        }
+        assert_eq!(m.html_text(), "hi");
+        assert_eq!(m.markdown_text(), "hi");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn flags_and_optional_fields_are_read_from_a_full_message() {
+        let server = FakeServer::start().await;
+        let c = client(&server);
+        let mut m = plain(&c, user_ref(5));
+        let raw = inner(&mut m);
+        raw.mentioned = true;
+        raw.media_unread = true;
+        raw.silent = true;
+        raw.post = true;
+        raw.from_scheduled = true;
+        raw.edit_hide = true;
+        raw.pinned = true;
+        raw.via_bot_id = Some(77);
+        raw.views = Some(10);
+        raw.forwards = Some(2);
+        raw.edit_date = Some(60);
+        raw.post_author = Some("me".into());
+        raw.grouped_id = Some(99);
+        raw.restriction_reason = Some(vec![tl::enums::RestrictionReason::Reason(
+            tl::types::RestrictionReason {
+                platform: "all".into(),
+                reason: "r".into(),
+                text: "t".into(),
+            },
+        )]);
+        raw.guestchat_via_from = Some(tl::enums::Peer::User(tl::types::PeerUser { user_id: 8 }));
+        raw.from_id = Some(tl::enums::Peer::User(tl::types::PeerUser { user_id: 9 }));
+        raw.replies = Some(tl::enums::MessageReplies::Replies(
+            tl::types::MessageReplies {
+                comments: true,
+                replies: 4,
+                replies_pts: 1,
+                recent_repliers: None,
+                channel_id: None,
+                max_id: None,
+                read_max_id: None,
+            },
+        ));
+        raw.reactions = Some(tl::enums::MessageReactions::Reactions(
+            tl::types::MessageReactions {
+                min: false,
+                can_see_list: false,
+                reactions_as_tags: false,
+                results: vec![
+                    tl::enums::ReactionCount::Count(tl::types::ReactionCount {
+                        chosen_order: None,
+                        reaction: tl::enums::Reaction::Empty,
+                        count: 3,
+                    }),
+                    tl::enums::ReactionCount::Count(tl::types::ReactionCount {
+                        chosen_order: None,
+                        reaction: tl::enums::Reaction::Empty,
+                        count: 4,
+                    }),
+                ],
+                recent_reactions: None,
+                top_reactors: None,
+            },
+        ));
+        raw.entities = Some(vec![
+            tl::types::MessageEntityBold {
+                offset: 0,
+                length: 2,
+            }
+            .into(),
+        ]);
+
+        assert!(m.mentioned() && m.media_unread() && m.silent() && m.post());
+        assert!(m.from_scheduled() && m.edit_hide() && m.pinned());
+        assert_eq!(m.via_bot_id(), Some(77));
+        assert_eq!(
+            (m.view_count(), m.forward_count(), m.reply_count()),
+            (Some(10), Some(2), Some(4))
+        );
+        assert_eq!(m.reaction_count(), Some(7));
+        assert_eq!(m.edit_date().unwrap().as_second(), 60);
+        assert_eq!((m.post_author(), m.grouped_id()), (Some("me"), Some(99)));
+        assert_eq!(m.restriction_reason().unwrap().len(), 1);
+        assert_eq!(m.sender_id(), Some(PeerId::user_unchecked(9)));
+        assert_eq!(m.guestchat_via_from_id(), Some(PeerId::user_unchecked(8)));
+        assert!(m.guestchat_via_from().is_none() && m.sender().is_none());
+        assert!(m.sender_ref().await.unwrap().is_none());
+        assert!(m.guestchat_via_from_ref().await.unwrap().is_none());
+        assert_eq!(m.fmt_entities().unwrap().len(), 1);
+        assert_eq!(m.html_text(), "<b>hi</b>");
+        assert_eq!(m.markdown_text(), "**hi**");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_sender_of_a_private_message_follows_who_sent_it() {
+        let server = FakeServer::start().await;
+        let c = client(&server);
+        let mut m = plain(&c, user_ref(5));
+        assert_eq!(m.sender_id(), Some(PeerId::self_user()));
+        inner(&mut m).out = false;
+        assert_eq!(m.sender_id(), Some(user_ref(5).id));
+        let group = plain(&c, channel_ref(9));
+        assert_eq!(group.sender_id(), None);
+        assert!(group.guestchat_via_from_id().is_none());
+        assert!(group.sender_ref().await.unwrap().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn service_and_empty_messages_answer_with_defaults() {
+        let server = FakeServer::start().await;
+        let c = client(&server);
+        let peer = user_ref(5);
+        let s = service(&c, peer);
+        assert_eq!((s.id(), s.date_timestamp(), s.text()), (8, 70, ""));
+        assert!(s.action().is_some());
+        assert!(!s.outgoing() && !s.mentioned() && !s.silent() && !s.post() && !s.media_unread());
+        assert!(!s.from_scheduled() && !s.edit_hide() && !s.pinned());
+        assert!(s.reply_header().is_none() && s.media().is_none() && s.reply_markup().is_none());
+        assert!(s.forward_header().is_none() && s.via_bot_id().is_none());
+        assert!(s.view_count().is_none() && s.edit_date().is_none() && s.post_author().is_none());
+        assert!(s.guestchat_via_from_id().is_none() && s.fmt_entities().is_none());
+        assert_eq!(s.sender_id(), Some(peer.id));
+        assert!(s.html_text().is_empty());
+
+        let e = empty(&c, peer);
+        assert_eq!((e.id(), e.date_timestamp(), e.text()), (2, 0, ""));
+        assert!(e.action().is_none() && e.forward_header().is_none() && e.rich_message().is_none());
+        assert!(!e.outgoing() && !e.mentioned() && !e.silent() && !e.post() && !e.media_unread());
+        assert!(!e.from_scheduled() && !e.edit_hide() && !e.pinned());
+        assert!(e.reply_header().is_none() && e.reply_markup().is_none() && e.media().is_none());
+        assert!(e.view_count().is_none() && e.forward_count().is_none() && e.edit_date().is_none());
+        assert!(
+            e.post_author().is_none()
+                && e.grouped_id().is_none()
+                && e.restriction_reason().is_none()
+        );
+        assert!(e.via_bot_id().is_none() && e.guestchat_via_from_id().is_none());
+        assert!(e.reply_count().is_none() && e.reaction_count().is_none());
+        assert!(e.reply_to_message_id().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn debug_output_names_the_message() {
+        let server = FakeServer::start().await;
+        let c = client(&server);
+        let peer = user_ref(5);
+        for m in [plain(&c, peer), service(&c, peer), empty(&c, peer)] {
+            assert!(format!("{m:?}").starts_with("Message {"));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reacting_sends_the_reaction_or_needs_a_chat() {
+        let server = FakeServer::start().await;
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        server.on(move |req: tl::functions::messages::SendReaction| {
+            log.lock().unwrap().push(req.msg_id);
+            Ok(tl::enums::Updates::Updates(tl::types::Updates {
+                updates: Vec::new(),
+                users: Vec::new(),
+                chats: Vec::new(),
+                date: 0,
+                seq: 0,
+            }))
+        });
+        let c = client(&server);
+        plain(&c, user_ref(5))
+            .react(InputReactions::emoticon("👍"))
+            .await
+            .unwrap();
+        assert_eq!(*seen.lock().unwrap(), [11]);
+        let mut lost = plain(&c, user_ref(5));
+        lost.fetched_in = None;
+        assert!(matches!(
+            lost.react(InputReactions::remove()).await,
+            Err(InvocationError::Dropped(_))
+        ));
+    }
+}
