@@ -15,8 +15,11 @@ Docs: <https://core.telegram.org/api/end-to-end/voice-calls>, <https://core.tele
 - DH group, exchange and `Key` come from `mtg-secret`.
 
 `mtg-client` runs it over a `Client` with feature `calls`: `client.calls(protocol)` gives `CallsClient`
-(`call`, `accept`, `received`, `discard`, `rate`, `handle_update`); `has_dh_config` tells whether incoming
+(`call`, `accept`, `received`, `discard`, `rate`, `signal`, `handle_update`); `has_dh_config` tells whether incoming
 calls can be seen yet (the driver fetches the config on the first call update).
+
+Signalling: `Calls::signal`/`CallsClient::signal` send the engine's bytes (`phone.sendSignalingData`);
+`updatePhoneCallSignalingData` of a live call gives `Event::Signaling { call_id, data }`.
 
 Updates that arrive before the `requestCall` answer are held (8 at most) and replayed.
 

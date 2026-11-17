@@ -147,6 +147,13 @@ pub enum Event {
         /// Send debug data ([`Calls::debug`]).
         need_debug: bool,
     },
+    /// The peer's media library sent signalling data: hand it to the engine.
+    Signaling {
+        /// Call id.
+        call_id: i64,
+        /// Opaque bytes for the engine.
+        data: Vec<u8>,
+    },
     /// The call broke the protocol (bad key, wrong hash); a discard was queued.
     Failed {
         /// Call id.
@@ -379,6 +386,19 @@ impl Calls {
         ))
     }
 
+    /// `phone.sendSignalingData`: the engine's bytes for the peer's engine.
+    pub fn signal(
+        &self,
+        call_id: i64,
+        data: Vec<u8>,
+    ) -> Result<tl::functions::phone::SendSignalingData> {
+        let call = self.calls.get(&call_id).ok_or(Error::NoSuchChat(0))?;
+        Ok(tl::functions::phone::SendSignalingData {
+            peer: input(call_id, call.access_hash),
+            data,
+        })
+    }
+
     /// `phone.setCallRating` (after [`Event::Ended`] with `need_rating`).
     pub fn rate(
         call_id: i64,
@@ -416,8 +436,17 @@ impl Calls {
     /// Handles an update; updates that are not about calls give an empty output.
     pub fn handle_update(&mut self, update: &tl::enums::Update) -> Output {
         let mut out = Output::default();
-        if let tl::enums::Update::PhoneCall(u) = update {
-            self.on_call(&u.phone_call, &mut out);
+        match update {
+            tl::enums::Update::PhoneCall(u) => self.on_call(&u.phone_call, &mut out),
+            tl::enums::Update::PhoneCallSignalingData(u)
+                if self.calls.contains_key(&u.phone_call_id) =>
+            {
+                out.events.push(Event::Signaling {
+                    call_id: u.phone_call_id,
+                    data: u.data.clone(),
+                });
+            }
+            _ => {}
         }
         out
     }

@@ -312,6 +312,28 @@ fn discard_ends_the_call() {
 }
 
 #[test]
+fn signalling_goes_both_ways_for_live_calls_only() {
+    let (mut a, _, _, _) = up_to_accept();
+    let sig = |id| {
+        tl::enums::Update::PhoneCallSignalingData(tl::types::UpdatePhoneCallSignalingData {
+            phone_call_id: id,
+            data: vec![1, 2],
+        })
+    };
+    assert_eq!(
+        a.handle_update(&sig(7)).events,
+        [Event::Signaling {
+            call_id: 7,
+            data: vec![1, 2]
+        }]
+    );
+    assert!(a.handle_update(&sig(8)).events.is_empty());
+    let s = a.signal(7, vec![3]).unwrap();
+    assert_eq!(s.data, vec![3]);
+    assert!(a.signal(8, vec![]).is_err());
+}
+
+#[test]
 fn own_discard_forgets_the_call() {
     let (_, mut b, _, _) = up_to_accept();
     let d = b

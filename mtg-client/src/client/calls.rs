@@ -120,6 +120,13 @@ impl CallsClient {
         Ok(())
     }
 
+    /// `phone.sendSignalingData`: bytes from the local media engine for the peer's engine.
+    pub async fn signal(&self, call_id: i64, data: Vec<u8>) -> Result<(), CallError> {
+        let request = self.lock().signal(call_id, data)?;
+        self.client.invoke(&request).await?;
+        Ok(())
+    }
+
     /// `phone.setCallRating` for an ended call.
     pub async fn rate(
         &self,
@@ -375,8 +382,10 @@ mod tests {
         server.on(|_: tl::functions::phone::RequestCall| Ok(answer(waiting(7))));
         server.on(|_: tl::functions::phone::DiscardCall| Ok(tl::enums::Updates::TooLong));
         server.on(|_: tl::functions::phone::SetCallRating| Ok(tl::enums::Updates::TooLong));
+        server.on(|_: tl::functions::phone::SendSignalingData| Ok(true));
         let calls = client(&server).calls(proto());
         calls.call(user_ref(5), false).await.unwrap();
+        calls.signal(7, vec![1]).await.unwrap();
         let reason = || tl::enums::PhoneCallDiscardReason::Hangup;
         calls.discard(7, 3, reason(), 0).await.unwrap();
         calls.rate(7, 9, 5, "fine").await.unwrap();
@@ -386,6 +395,10 @@ mod tests {
         assert!(matches!(e, CallError::Call(_)));
         assert!(e.to_string().starts_with("call:"));
         assert!(matches!(calls.received(7).await, Err(CallError::Call(_))));
+        assert!(matches!(
+            calls.signal(7, vec![]).await,
+            Err(CallError::Call(_))
+        ));
         assert!(matches!(calls.accept(7).await, Err(CallError::Call(_))));
 
         // a failing server is an invoke error
