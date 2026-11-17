@@ -10,6 +10,8 @@
 
 mod auth;
 mod bots;
+#[cfg(feature = "calls")]
+mod calls;
 mod cdn;
 mod chats;
 #[allow(clippy::module_inception)]
@@ -23,6 +25,8 @@ mod updates;
 
 pub use auth::{LoginToken, PasswordToken, SignInError};
 pub use bots::{InlineResult, InlineResultIter};
+#[cfg(feature = "calls")]
+pub use calls::{CallError, CallsClient};
 pub use chats::{ParticipantIter, ParticipantPermissions, ProfilePhotoIter};
 pub(crate) use client::ClientInner;
 pub use client::{Client, ClientConfiguration};

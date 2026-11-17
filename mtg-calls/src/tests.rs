@@ -17,6 +17,25 @@ fn config() -> tl::enums::messages::DhConfig {
     })
 }
 
+#[test]
+fn incoming_calls_need_the_dh_config() {
+    let mut c = Calls::new(protocol(92, vec!["2.7.7".into()]));
+    assert!(!c.has_dh_config());
+    assert!(
+        c.handle_update(&update(requested(7, vec![0; 32])))
+            .events
+            .is_empty()
+    );
+    c.set_dh_config(&config()).unwrap();
+    assert!(c.has_dh_config());
+    assert_eq!(
+        c.handle_update(&update(requested(7, vec![0; 32])))
+            .events
+            .len(),
+        1
+    );
+}
+
 fn calls() -> Calls {
     let mut c = Calls::new(protocol(92, vec!["2.7.7".into()]));
     c.set_dh_config(&config()).unwrap();

@@ -14,6 +14,10 @@ Docs: <https://core.telegram.org/api/end-to-end/voice-calls>, <https://core.tele
 - `emoji(&Key)`: the four emojis of the key (SHA-256 of the key, as the official client).
 - DH group, exchange and `Key` come from `mtg-secret`.
 
+`mtg-client` runs it over a `Client` with feature `calls`: `client.calls(protocol)` gives `CallsClient`
+(`call`, `accept`, `received`, `discard`, `rate`, `handle_update`); `has_dh_config` tells whether incoming
+calls can be seen yet (the driver fetches the config on the first call update).
+
 Updates that arrive before the `requestCall` answer are held (8 at most) and replayed.
 
 Not done: group calls (`phone.joinGroupCall` needs a WebRTC offer), conference calls, the media

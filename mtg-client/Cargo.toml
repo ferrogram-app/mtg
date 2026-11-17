@@ -16,6 +16,7 @@ markdown = ["dep:pulldown-cmark"]
 html = ["dep:html5ever"]
 proxy = ["mtg-mtsender/proxy"]
 parse_invite_link = ["dep:url"]
+calls = ["dep:mtg-calls", "dep:mtg-secret"]
 fs = ["tokio/fs"]
 default = ["fs"]
 
@@ -23,8 +24,10 @@ default = ["fs"]
 futures-util = { version = "0.3.34", default-features = false, features = [
     "alloc"
 ] }
+mtg-calls = { path = "../mtg-calls", version = "0.0.1", optional = true }
 mtg-crypto = { path = "../mtg-crypto", version = "0.0.1" }
 mtg-mtsender = { path = "../mtg-mtsender", version = "0.0.1" }
+mtg-secret = { path = "../mtg-secret", version = "0.0.1", optional = true }
 mtg-session = { path = "../mtg-session", version = "0.0.1", default-features = false }
 mtg-tl-types = { path = "../mtg-tl-types", version = "0.0.1", features = [
     "tl-mtproto",

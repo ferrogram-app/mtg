@@ -252,6 +252,11 @@ impl Calls {
         Ok(())
     }
 
+    /// The DH config is known: without it incoming calls are ignored (see [`Calls::set_dh_config`]).
+    pub fn has_dh_config(&self) -> bool {
+        self.params.is_some()
+    }
+
     fn params(&self) -> Result<&DhParams> {
         self.params
             .as_ref()

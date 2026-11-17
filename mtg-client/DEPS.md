@@ -1,5 +1,9 @@
 # Dependencies
 
+## mtg-calls
+
+Optional (feature `calls`): the signalling state machine behind `Client::calls`.
+
 ## mtg-crypto
 
 Used for supporting logging in to accounts with 2-factor authentication enabled.
@@ -7,6 +11,10 @@ Used for supporting logging in to accounts with 2-factor authentication enabled.
 ## mtg-mtsender
 
 Used to drive the network connection to Telegram.
+
+## mtg-secret
+
+Optional (feature `calls`): its `Error` is part of `CallError`.
 
 ## mtg-session
 
