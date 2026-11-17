@@ -764,7 +764,9 @@ mod tests {
         ] {
             assert!(!flag);
         }
+        #[cfg(feature = "html")]
         assert_eq!(m.html_text(), "hi");
+        #[cfg(feature = "markdown")]
         assert_eq!(m.markdown_text(), "hi");
     }
 
@@ -853,7 +855,9 @@ mod tests {
         assert!(m.sender_ref().await.unwrap().is_none());
         assert!(m.guestchat_via_from_ref().await.unwrap().is_none());
         assert_eq!(m.fmt_entities().unwrap().len(), 1);
+        #[cfg(feature = "html")]
         assert_eq!(m.html_text(), "<b>hi</b>");
+        #[cfg(feature = "markdown")]
         assert_eq!(m.markdown_text(), "**hi**");
     }
 
@@ -886,6 +890,7 @@ mod tests {
         assert!(s.view_count().is_none() && s.edit_date().is_none() && s.post_author().is_none());
         assert!(s.guestchat_via_from_id().is_none() && s.fmt_entities().is_none());
         assert_eq!(s.sender_id(), Some(peer.id));
+        #[cfg(feature = "html")]
         assert!(s.html_text().is_empty());
 
         let e = empty(&c, peer);

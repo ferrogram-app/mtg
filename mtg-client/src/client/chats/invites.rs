@@ -109,7 +109,9 @@ mod tests {
     use mtg_testkit::FakeServer;
 
     use super::*;
-    use crate::test_util::{channel, channel_ref, chat, client};
+    #[cfg(feature = "parse_invite_link")]
+    use crate::test_util::chat;
+    use crate::test_util::{channel, channel_ref, client};
 
     fn joined(chats: Vec<tl::enums::Chat>) -> tl::enums::messages::ChatInviteJoinResult {
         tl::types::messages::ChatInviteJoinResultOk {
