@@ -26,6 +26,7 @@ use tokio::{
 use super::Client;
 use crate::media::{Downloadable, Uploaded};
 use crate::utils::generate_random_id;
+use mtg_session::types::PeerRef;
 
 pub const MIN_CHUNK_SIZE: i32 = 4 * 1024;
 pub const MAX_CHUNK_SIZE: i32 = 512 * 1024;
@@ -40,6 +41,8 @@ pub struct DownloadIter {
     size: Option<usize>,
     variant: DownloadIterVariant,
     dc_id: Option<i32>,
+    /// Message the media came from, to refresh an expired file reference.
+    source: Option<(PeerRef, i32)>,
 }
 
 enum DownloadIterVariant {
@@ -75,6 +78,13 @@ impl DownloadIter {
         self
     }
 
+    /// Tells where the media came from: when Telegram answers `FILE_REFERENCE_*`, the message is
+    /// fetched again and the download continues with its fresh file reference (once per chunk).
+    pub fn refresh_from<C: Into<PeerRef>>(mut self, peer: C, message_id: i32) -> Self {
+        self.source = Some((peer.into(), message_id));
+        self
+    }
+
     /// Fetch and return the next chunk.
     pub async fn next(&mut self) -> Result<Option<Vec<u8>>, InvocationError> {
         if self.done {
@@ -95,7 +105,7 @@ impl DownloadIter {
             DownloadIterVariant::Empty => return Ok(None),
         };
 
-        // TODO handle maybe FILEREF_UPGRADE_NEEDED
+        let mut refreshed = false;
         let mut dc = self
             .dc_id
             .map_or_else(|| self.client.0.session.home_dc_id(), Ok)?;
@@ -131,6 +141,22 @@ impl DownloadIter {
                     dc = err.value.unwrap_or_default() as _;
                     continue;
                 }
+                Err(InvocationError::Rpc(err))
+                    if err.name.starts_with("FILE_REFERENCE_") && !refreshed =>
+                {
+                    refreshed = true;
+                    match self.refresh_reference(&mut request).await {
+                        Ok(true) => continue,
+                        Ok(false) => {
+                            self.variant = DownloadIterVariant::Request(request);
+                            Err(InvocationError::Rpc(err))
+                        }
+                        Err(e) => {
+                            self.variant = DownloadIterVariant::Request(request);
+                            Err(e)
+                        }
+                    }
+                }
                 // the offset is at (or past) the end: the file ended on a chunk boundary
                 Err(InvocationError::Rpc(err))
                     if err.name == "OFFSET_INVALID" && request.offset > 0 =>
@@ -149,6 +175,44 @@ impl DownloadIter {
 }
 
 /// Method implementations related to uploading or downloading files.
+fn file_reference(location: &mut tl::enums::InputFileLocation) -> Option<&mut Vec<u8>> {
+    match location {
+        tl::enums::InputFileLocation::InputDocumentFileLocation(l) => Some(&mut l.file_reference),
+        tl::enums::InputFileLocation::InputPhotoFileLocation(l) => Some(&mut l.file_reference),
+        _ => None,
+    }
+}
+
+impl DownloadIter {
+    /// Re-fetches the source message and copies the fresh file reference into `request`.
+    /// `Ok(false)`: nothing to refresh from (no source, message or media gone).
+    async fn refresh_reference(
+        &self,
+        request: &mut tl::functions::upload::GetFile,
+    ) -> Result<bool, InvocationError> {
+        let Some((peer, id)) = self.source else {
+            return Ok(false);
+        };
+        let message = self
+            .client
+            .get_messages_by_id(peer, &[id])
+            .await?
+            .pop()
+            .flatten();
+        let fresh = message
+            .and_then(|m| m.media())
+            .and_then(|m| m.to_raw_input_location())
+            .and_then(|mut l| file_reference(&mut l).map(mem::take));
+        match (fresh, file_reference(&mut request.location)) {
+            (Some(new), Some(old)) => {
+                *old = new;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+}
+
 impl Client {
     /// Returns a new iterator over the contents of a media document that will be downloaded.
     ///
@@ -175,6 +239,7 @@ impl Client {
                 size: Some(data.len()),
                 variant: DownloadIterVariant::PreDownloaded(data),
                 dc_id: downloadable.dc_id(),
+                source: None,
             }
         } else if let Some(location) = downloadable.to_raw_input_location() {
             DownloadIter {
@@ -189,6 +254,7 @@ impl Client {
                     limit: MAX_CHUNK_SIZE,
                 }),
                 dc_id: downloadable.dc_id(),
+                source: None,
             }
         } else {
             DownloadIter {
@@ -197,6 +263,7 @@ impl Client {
                 size: None,
                 variant: DownloadIterVariant::PreFailed(io::Error::other("media not downloadable")),
                 dc_id: downloadable.dc_id(),
+                source: None,
             }
         }
     }
@@ -573,6 +640,136 @@ mod tests {
                 Ok(file(vec![9; 10]))
             }
         });
+    }
+
+    /// A message in `peer` whose document carries `reference`.
+    fn with_document(peer: PeerRef, reference: Option<Vec<u8>>) -> tl::enums::messages::Messages {
+        let mut m = crate::test_util::message(7, peer, "", 0);
+        if let (tl::enums::Message::Message(m), Some(file_reference)) = (&mut m, reference) {
+            m.media = Some(
+                tl::types::MessageMediaDocument {
+                    nopremium: false,
+                    spoiler: false,
+                    video: false,
+                    round: false,
+                    voice: false,
+                    document: Some(
+                        tl::types::Document {
+                            id: 1,
+                            access_hash: 2,
+                            file_reference,
+                            date: 0,
+                            mime_type: "a/b".into(),
+                            size: 10,
+                            thumbs: None,
+                            video_thumbs: None,
+                            dc_id: 2,
+                            attributes: Vec::new(),
+                        }
+                        .into(),
+                    ),
+                    alt_documents: None,
+                    video_cover: None,
+                    video_timestamp: None,
+                    ttl_seconds: None,
+                }
+                .into(),
+            );
+        }
+        tl::types::messages::Messages {
+            messages: vec![m],
+            topics: Vec::new(),
+            chats: Vec::new(),
+            users: Vec::new(),
+        }
+        .into()
+    }
+
+    struct Doc(Vec<u8>);
+
+    impl Downloadable for Doc {
+        fn to_raw_input_location(&self) -> Option<tl::enums::InputFileLocation> {
+            Some(
+                tl::types::InputDocumentFileLocation {
+                    id: 1,
+                    access_hash: 2,
+                    file_reference: self.0.clone(),
+                    thumb_size: String::new(),
+                }
+                .into(),
+            )
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_expired_file_reference_is_refreshed_from_the_message_once() {
+        let server = FakeServer::start().await;
+        let peer = crate::test_util::user_ref(5);
+        server.on(move |req: tl::functions::upload::GetFile| {
+            let tl::enums::InputFileLocation::InputDocumentFileLocation(l) = req.location else {
+                panic!("not a document")
+            };
+            if l.file_reference == [2] {
+                Ok(file(vec![9; 10]))
+            } else {
+                Err((400, "FILE_REFERENCE_EXPIRED".into()))
+            }
+        });
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let seen = fetches.clone();
+        server.on(move |_: tl::functions::messages::GetMessages| {
+            seen.fetch_add(1, SeqCst);
+            Ok(with_document(peer, Some(vec![2])))
+        });
+        let client = client(&server);
+        let mut it = client.iter_download(&Doc(vec![1])).refresh_from(peer, 7);
+        assert_eq!(it.next().await.unwrap().unwrap(), vec![9; 10]);
+        assert_eq!(fetches.load(SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_file_reference_that_stays_bad_fails_after_one_refresh() {
+        let server = FakeServer::start().await;
+        let peer = crate::test_util::user_ref(5);
+        server.on(|_: tl::functions::upload::GetFile| Err((400, "FILE_REFERENCE_EXPIRED".into())));
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let seen = fetches.clone();
+        server.on(move |_: tl::functions::messages::GetMessages| {
+            seen.fetch_add(1, SeqCst);
+            Ok(with_document(peer, Some(vec![2])))
+        });
+        let client = client(&server);
+        let mut it = client.iter_download(&Doc(vec![1])).refresh_from(peer, 7);
+        let InvocationError::Rpc(e) = it.next().await.unwrap_err() else {
+            panic!("not an rpc error")
+        };
+        assert_eq!(e.name, "FILE_REFERENCE_EXPIRED");
+        assert_eq!(fetches.load(SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn nothing_to_refresh_from_leaves_the_error() {
+        let server = FakeServer::start().await;
+        let peer = crate::test_util::user_ref(5);
+        server.on(|_: tl::functions::upload::GetFile| Err((400, "FILE_REFERENCE_EXPIRED".into())));
+        let client = client(&server);
+        // no source at all
+        let mut it = client.iter_download(&Doc(vec![1]));
+        assert!(matches!(it.next().await, Err(InvocationError::Rpc(_))));
+        // the message lost its media
+        server.on(move |_: tl::functions::messages::GetMessages| Ok(with_document(peer, None)));
+        let mut it = client.iter_download(&Doc(vec![1])).refresh_from(peer, 7);
+        assert!(matches!(it.next().await, Err(InvocationError::Rpc(_))));
+        // the location kind has no file reference
+        let mut it = client.iter_download(&thing(None)).refresh_from(peer, 7);
+        assert!(matches!(it.next().await, Err(InvocationError::Rpc(_))));
+        // the lookup itself fails
+        server.on(|_: tl::functions::messages::GetMessages| Err((500, "INTERNAL".into())));
+        let mut it = client.iter_download(&Doc(vec![1])).refresh_from(peer, 7);
+        let InvocationError::Rpc(e) = it.next().await.unwrap_err() else {
+            panic!("not an rpc error")
+        };
+        assert_eq!(e.name, "INTERNAL");
     }
 
     #[tokio::test(flavor = "multi_thread")]
